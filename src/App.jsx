@@ -1,518 +1,673 @@
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 
-/**
- * SVNP‑Imbetiba — DECISOR (v0.92)
- * --------------------------------
- * Funcional + layout aprovado + "base limpa" nos parâmetros para consulta:
- * - Inputs numéricos iniciam vazios (""), sem valores predefinidos.
- * - Coerção numérica segura no motor de decisão (vazio ⇒ 0) para não quebrar cálculos.
- * - Mantém regras: NPCP sempre ativo, CMR por maré (gate), matriz Hs×Tp, rajada 27 kn, pior caso de vento.
- * - Layout: Decisão Geral no topo; 1ª linha: Meteo & Hidro (esq) + Navio/Berço/Canal/Maré (dir); 2ª linha: Navegação & Permanência.
- */
+// =============================================
+// SVNP‑Imbetiba 2.0 — Centro Operacional (rev I)
+// =============================================
+// Fix: removido fragmento JSX solto após <VesselRow/> que causava SyntaxError.
+// Fix: Nota técnica mantida via modal; botão GitHub simplificado para salvar somente vessels.
 
-// ---------- UI utilitários ----------
-const Card = ({ title, desc, children, right }) => (
-  <div className="bg-white rounded-2xl shadow-sm border border-slate-200/60">
-    <div className="flex items-start justify-between p-4 border-b border-slate-100">
-      <div>
-        <h2 className="font-semibold text-slate-900">{title}</h2>
-        {desc && <p className="text-xs text-slate-500 mt-0.5">{desc}</p>}
-      </div>
-      {right}
-    </div>
-    <div className="p-4">{children}</div>
-  </div>
-);
+// ---------------- Constantes/Util ----------------
+const RAJADA_TETO = 27; // kn universal
+const MAX_LOA = 120; // m
+const MAX_DRAFT = 8.4; // m
 
-const Pill = ({ children, tone = "slate", size = "md" }) => {
-  const tones = {
-    slate: "bg-slate-100 text-slate-700 ring-1 ring-inset ring-slate-200",
-    ok: "bg-emerald-600 text-white ring-1 ring-emerald-700/20",
-    warn: "bg-amber-600 text-white ring-1 ring-amber-700/20",
-    bad: "bg-rose-600 text-white ring-1 ring-rose-700/20",
-    info: "bg-blue-600 text-white ring-1 ring-blue-700/20",
-  };
-  const sizes = { sm: "text-xs px-2 py-1", md: "text-sm px-3 py-1.5", lg: "text-base px-4 py-2" };
-  return <span className={`inline-flex items-center rounded-full font-semibold shadow-sm ${tones[tone]} ${sizes[size]}`}>{children}</span>;
-};
-
-const Label = ({ children, hint }) => (
-  <label className="block text-[13px] font-medium text-slate-700">
-    {children}
-    {hint && <span className="block text-[11px] font-normal text-slate-500">{hint}</span>}
-  </label>
-);
-
-const NumberInput = ({ value, onChange, step = 1, suffix, min, max, placeholder }) => (
-  <div className="relative">
-    <input
-      type="number"
-      step={step}
-      min={min}
-      max={max}
-      className="w-full border border-slate-300 rounded-lg px-3 py-2 pr-10 text-sm focus:outline-none focus:ring-2 focus:ring-blue-200"
-      value={value === undefined || value === null ? "" : value}
-      placeholder={placeholder}
-      onChange={(e) => {
-        const v = e.target.value;
-        if (v === "" || v === null) { onChange(""); return; }
-        const n = parseFloat(v);
-        onChange(Number.isFinite(n) ? n : "");
-      }}
-    />
-    {suffix && <span className="absolute inset-y-0 right-2 flex items-center text-[11px] text-slate-500">{suffix}</span>}
-  </div>
-);
-
-// ---------- Catálogos ----------
-const PIERS = [ { id: "P1", label: "Píer 1" }, { id: "P2", label: "Píer 2" }, { id: "P3", label: "Píer 3" } ];
-const SIDES = [ { id: "praia", label: "Lado Praia" }, { id: "mar", label: "Lado Mar" } ];
-const CATEGORIES = [
-  { id: "A", label: "Categoria A" },
-  { id: "B", label: "Categoria B (generalizada)" },
-  { id: "C", label: "Categoria C" },
-  { id: "TANQUE", label: "Navio Tanque" },
+const ANCH_ZONES = [
+  { id: "alpha", label: "Alpha" },
+  { id: "bravo", label: "Bravo" },
+  { id: "delta", label: "Delta" },
 ];
 const CANAIS = [ { id: "norte", label: "Canal Norte" }, { id: "sul", label: "Canal Sul" } ];
+const PIERS = [ { id: "P1", label: "Píer 1" }, { id: "P2", label: "Píer 2" }, { id: "P3", label: "Píer 3" } ];
+const SIDES = [ { id: "praia", label: "Lado Praia" }, { id: "mar", label: "Lado Mar" } ];
+const BOLLARDS = ["Alfa","Bravo","Charlie","Delta","Echo","Foxtrot"];
+const CATALOG_LS_KEY = 'svnp_catalog_v1';
 
-// ---------- Regras fixas ----------
-const RAJADA_TETO = 27; // kn universal
+function clsJoin(...a){return a.filter(Boolean).join(' ')}
 
-// Limites de canal (entrada) — matriz Hs×Tp (operador E)
-const CANAL_LIMITS = {
-  A: { hs: 1.5, tp: 12 },
-  B: { p3_mar: { hs: 1.5, tp: 12 }, outros: { hs: 2.0, tp: 12 } },
-  C: { p3_mar: { hs: 1.5, tp: 12 }, outros: { hs: 2.0, tp: 12 } },
-  TANQUE: { p1_mar: { hs: 1.5, tp: 12 }, p2_praia: { hs: 1.5, tp: 12 } },
-};
-
-// CMR por maré (interpolação linear 0.0→1.2 m)
+// Tabela CMR (interpolação linear 0→1.2 m)
 const CMR_TABLE = {
   canalSul: { m0: 9.1, m1_2: 10.2 },
   canalNorte: { m0: 8.0, m1_2: 9.1 },
   bacia: { m0: 9.0, m1_2: 10.1 },
   piersNorte: { m0: 8.0, m1_2: 9.1 },
 };
-function interpCMR(row, mare) {
-  const f = Math.max(0, Math.min(1, mare / 1.2));
-  return +(row.m0 + (row.m1_2 - row.m0) * f).toFixed(2);
-}
+function interpCMR(row, mare){ const f=Math.max(0,Math.min(1,(+mare||0)/1.2)); return +(row.m0+(row.m1_2-row.m0)*f).toFixed(2); }
 
-// Limites on‑berth (P1 & P1P) — presets fornecidos (resumo consolidado)
-const PRESETS_ON_BERTH = {
-  A: {
-    "P1-praia": { 1: { P1: { tp: 12.2, hs: 1.12 }, P1P: { tp: 12.2, hs: 0.09 } }, 2: { P1: { tp: 11.4, hs: 1.19 }, P1P: { tp: 11.4, hs: 0.09 } } },
-    "P1-mar": { 1: { P1: { tp: 12.4, hs: 1.17 }, P1P: { tp: 12.4, hs: 0.09 } }, 2: { P1: { tp: 11.8, hs: 1.20 }, P1P: { tp: 11.8, hs: 0.09 } } },
-    "P3-praia": { 1: { P1: { tp: 14.5, hs: 3.73 }, P1P: { tp: 14.5, hs: 0.20 } }, 2: { P1: { tp: 20.4, hs: 3.77 }, P1P: { tp: 20.4, hs: 0.25 } }, 3: { P1: { tp: 14.5, hs: 3.73 }, P1P: { tp: 14.5, hs: 0.20 } }, 4: { P1: { tp: 14.7, hs: 2.83 }, P1P: { tp: 14.7, hs: 0.19 } } },
-  },
-  B: {
-    "P1-praia": { 1: { P1: { tp: 16.9, hs: 2.39 }, P1P: { tp: 16.9, hs: 0.17 } }, 2: { P1: { tp: 9.3, hs: 1.04 }, P1P: { tp: 9.3, hs: 0.08 } } },
-    "P1-mar": { 1: { P1: { tp: 20.4, hs: 3.77 }, P1P: { tp: 20.4, hs: 0.25 } }, 2: { P1: { tp: 10.5, hs: 1.10 }, P1P: { tp: 10.5, hs: 0.09 } } },
-    "P2-praia": { 1: { P1: { tp: 20.4, hs: 3.77 }, P1P: { tp: 20.4, hs: 0.25 } }, 2: { P1: { tp: 11.6, hs: 2.74 }, P1P: { tp: 11.6, hs: 0.20 } } },
-    "P2-mar": { 1: { P1: { tp: 20.4, hs: 3.77 }, P1P: { tp: 20.4, hs: 0.25 } }, 2: { P1: { tp: 13.5, hs: 2.44 }, P1P: { tp: 13.5, hs: 0.20 } } },
-    "P3-praia": { 1: { P1: { tp: 20.4, hs: 3.77 }, P1P: { tp: 20.4, hs: 0.25 } }, 2: { P1: { tp: 20.4, hs: 3.77 }, P1P: { tp: 20.4, hs: 0.25 } } },
-    "P3-mar": { 1: { P1: { tp: 20.4, hs: 3.77 }, P1P: { tp: 20.4, hs: 0.25 } }, 2: { P1: { tp: 14.5, hs: 1.15 }, P1P: { tp: 14.5, hs: 0.09 } } },
-  },
-  C: {
-    "P1-praia": { 1: { P1: { tp: 11.9, hs: 1.05 }, P1P: { tp: 11.9, hs: 0.08 } }, 2: { P1: { tp: 20.4, hs: 3.77 }, P1P: { tp: 20.4, hs: 0.25 } } },
-    "P1-mar": { 1: { P1: { tp: 15.0, hs: 2.48 }, P1P: { tp: 15.0, hs: 0.17 } }, 2: { P1: { tp: 12.8, hs: 2.38 }, P1P: { tp: 12.8, hs: 0.16 } } },
-    "P2-praia": { 1: { P1: { tp: 14.6, hs: 2.39 }, P1P: { tp: 14.6, hs: 0.19 } }, 2: { P1: { tp: 20.4, hs: 3.77 }, P1P: { tp: 20.4, hs: 0.25 } } },
-    "P2-mar": { 1: { P1: { tp: 20.4, hs: 3.77 }, P1P: { tp: 20.4, hs: 0.25 } }, 2: { P1: { tp: 20.4, hs: 3.77 }, P1P: { tp: 20.4, hs: 0.25 } } },
-  },
+// Regras de Canal (entrada)
+const CANAL_LIMITS = {
+  A: { hs: 1.5, tp: 12 },
+  B: { p3_mar: { hs: 1.5, tp: 12 }, outros: { hs: 2.0, tp: 12 } },
+  C: { p3_mar: { hs: 1.5, tp: 12 }, outros: { hs: 2.0, tp: 12 } },
+  T: { p1_mar: { hs: 1.5, tp: 12 }, p2_praia: { hs: 1.5, tp: 12 } },
 };
-
-// ---------- Helpers ----------
-function keyPierSide(pierId, sideId) { return `${pierId}-${sideId}`; }
-function minPairCorrect(a, b) { return { tp: Math.min(a.tp, b.tp), hs: Math.min(a.hs, b.hs) }; }
-
-function canalRuleFor(category, pierId, sideId) {
-  if (category === "A") return CANAL_LIMITS.A;
-  if (category === "B") return (pierId === "P3" && sideId === "mar") ? CANAL_LIMITS.B.p3_mar : CANAL_LIMITS.B.outros;
-  if (category === "C") return (pierId === "P3" && sideId === "mar") ? CANAL_LIMITS.C.p3_mar : CANAL_LIMITS.C.outros;
-  if (category === "TANQUE") {
-    if (pierId === "P1" && sideId === "mar") return CANAL_LIMITS.TANQUE.p1_mar;
-    if (pierId === "P2" && sideId === "praia") return CANAL_LIMITS.TANQUE.p2_praia;
+function canalRuleFor(category, pierId, sideId){
+  if(category==='A') return CANAL_LIMITS.A;
+  if(category==='B') return (pierId==='P3'&&sideId==='mar')? CANAL_LIMITS.B.p3_mar : CANAL_LIMITS.B.outros;
+  if(category==='C') return (pierId==='P3'&&sideId==='mar')? CANAL_LIMITS.C.p3_mar : CANAL_LIMITS.C.outros;
+  if(category==='T'){
+    if(pierId==='P1'&&sideId==='mar') return CANAL_LIMITS.T.p1_mar;
+    if(pierId==='P2'&&sideId==='praia') return CANAL_LIMITS.T.p2_praia;
     return null;
   }
   return null;
 }
 
-function ventoMedioLimite(category, pierId, sideId, vizinhoOcupado) {
-  if (category === "A") return vizinhoOcupado ? 15 : 18;
-  if (category === "B") return (pierId === "P3" && sideId === "mar") ? 15 : 27;
-  if (category === "C") {
-    if (pierId === "P3" && sideId === "mar") return 15;
-    if (pierId === "P3" && sideId === "praia") return 27;
-    return vizinhoOcupado ? 15 : 18; // P1/P2
+function ventoMedioLimite(category,pierId,sideId,vizinhoOcupado){
+  if(category==='A') return vizinhoOcupado?15:18;
+  if(category==='B') return (pierId==='P3'&&sideId==='mar')?15:27;
+  if(category==='C'){
+    if(pierId==='P3'&&sideId==='mar') return 15;
+    if(pierId==='P3'&&sideId==='praia') return 27;
+    return vizinhoOcupado?15:18; // P1/P2
   }
-  if (category === "TANQUE") {
-    if ((pierId === "P1" && sideId === "mar") || (pierId === "P2" && sideId === "praia")) return vizinhoOcupado ? 15 : 18;
+  if(category==='T'){
+    if((pierId==='P1'&&sideId==='mar')||(pierId==='P2'&&sideId==='praia')) return vizinhoOcupado?15:18;
     return null;
   }
   return null;
 }
 
-// ---------- App ----------
-export default function App() {
-  // Navio / operação (inputs "limpos")
-  const [category, setCategory] = useState("A");
-  const [loa, setLoa] = useState("");
-  const [boa, setBoa] = useState("");
-  const [calado, setCalado] = useState("");
-  const [isAHTS18k, setIsAHTS18k] = useState(false);
+// Categoriza automaticamente com base na tabela fornecida
+function autoCategory(loa, boa){
+  const L = parseFloat(String(loa??'').replace(',','.'));
+  const B = parseFloat(String(boa??'').replace(',','.'));
+  if(!Number.isFinite(L)||!Number.isFinite(B)) return 'B';
+  // Tanque (perfil conhecido ~88×14.8)
+  if(Math.abs(L-88.1)<=5 && Math.abs(B-14.82)<=1) return 'T';
+  // A: (B>=22 & L>=93) ou (B<22 & L>=95)
+  if((B>=22 && L>=93) || (B<22 && L>=95)) return 'A';
+  // B: 16<=B<22 & 73<=L<95
+  if(B>=16 && B<22 && L>=73 && L<95) return 'B';
+  // C: B<16 & L<=90
+  if(B<16 && L<=90) return 'C';
+  return 'B';
+}
 
-  // Berço
-  const [pier, setPier] = useState("P1");
-  const [side, setSide] = useState("praia");
-  const [arranjo, setArranjo] = useState(1);
-  const [vizinhoOcupado, setVizinhoOcupado] = useState(false);
-  const [distCostadosOK, setDistCostadosOK] = useState(true); // ≥10 m com vizinho
+// --------------- UI primitives ---------------
+const Pill = ({ children, tone='slate', size='md' })=>{
+  const tones={slate:'bg-slate-100 text-slate-700 ring-1 ring-slate-200',ok:'bg-emerald-600 text-white',warn:'bg-amber-600 text-white',bad:'bg-rose-600 text-white',info:'bg-blue-600 text-white'};
+  const sizes={sm:'text-xs px-2 py-1',md:'text-sm px-3 py-1.5',lg:'text-base px-4 py-2'};
+  return <span className={clsJoin('inline-flex items-center rounded-full font-semibold shadow-sm',tones[tone],sizes[size])}>{children}</span>;
+};
+const Label = ({children,hint})=> (<label className="block text-[13px] font-medium text-slate-700">{children}{hint&&<span className="block text-[11px] font-normal text-slate-500">{hint}</span>}</label>);
+const SmallBtn = ({children,onClick,tone='default'})=>{
+  const map={default:'bg-slate-100 text-slate-700 hover:bg-slate-200',primary:'bg-blue-600 text-white hover:bg-blue-700',success:'bg-emerald-600 text-white hover:bg-emerald-700',danger:'bg-rose-600 text-white hover:bg-rose-700'};
+  return <button onClick={onClick} className={clsJoin('text-sm px-3 py-1.5 rounded-lg shadow-sm',map[tone])}>{children}</button>;
+};
+const IconBtn = ({title,onClick,children})=> (<button title={title} onClick={onClick} className="w-8 h-8 inline-flex items-center justify-center rounded-lg bg-slate-100 text-slate-700 hover:bg-slate-200">{children??'ℹ︎'}</button>);
+const Card = ({title,desc,children,right})=> (
+  <div className="bg-white rounded-2xl shadow-sm border border-slate-200/70">
+    <div className="flex items-start justify-between p-4 border-b border-slate-100">
+      <div><h2 className="font-semibold text-slate-900">{title}</h2>{desc&&<p className="text-xs text-slate-500 mt-0.5">{desc}</p>}</div>
+      {right}
+    </div>
+    <div className="p-4">{children}</div>
+  </div>
+);
 
-  // Meteo/Hidro (grupo único de sensores) — inputs limpos
-  const [canalAcesso, setCanalAcesso] = useState("norte");
-  const [mare, setMare] = useState("");
-  const [ventoMedioExt, setVentoMedioExt] = useState("");
-  const [ventoRajadaExt, setVentoRajadaExt] = useState("");
-  const [canalHsExt, setCanalHsExt] = useState("");
-  const [canalTpExt, setCanalTpExt] = useState("");
-  const [ventoMedioInt, setVentoMedioInt] = useState("");
-  const [ventoRajadaInt, setVentoRajadaInt] = useState("");
-  const [p1pHsInt, setP1pHsInt] = useState("");
-  const [p1pTpInt, setP1pTpInt] = useState("");
-
-  // NPCP e Persistência sempre OK
-  const umaPorVezOk = true, sogOk = true, proibicoesOk = true, ukcOk = true, autorizacaoOk = true;
-  const persistenciaOk = true;
-
-  // Limites on‑berth automáticos
-  const k = keyPierSide(pier, side);
-  const preset = PRESETS_ON_BERTH[category]?.[k]?.[arranjo];
-  const onP1Lim = preset?.P1 ?? { tp: 12, hs: 1.2 };
-  const onP1PLim = preset?.P1P ?? { tp: 12, hs: 0.2 };
-
-  // ---------- Motor de decisão ----------
-  const decision = useMemo(() => {
-    // Coerções numéricas seguras (inputs vazios ⇒ 0)
-    const nLoa = parseFloat(loa) || 0;
-    const nBoa = parseFloat(boa) || 0;
-    const nCalado = parseFloat(calado) || 0;
-    const nMare = parseFloat(mare) || 0;
-    const nVentoMedioExt = parseFloat(ventoMedioExt) || 0;
-    const nVentoRajadaExt = parseFloat(ventoRajadaExt) || 0;
-    const nCanalHsExt = parseFloat(canalHsExt) || 0;
-    const nCanalTpExt = parseFloat(canalTpExt) || 0;
-    const nVentoMedioInt = parseFloat(ventoMedioInt) || 0;
-    const nVentoRajadaInt = parseFloat(ventoRajadaInt) || 0;
-    const nHsInt = parseFloat(p1pHsInt) || 0;
-    const nTpInt = parseFloat(p1pTpInt) || 0;
-
-    // NAV — externo
-    const navReasons = [];
-    const navFails = [];
-    let navOK = true;
-
-    // Restrições de categoria/berço
-    if (category === "A" && pier === "P3" && side === "mar") {
-      navOK = false; const msg = "Cat. A não autorizado em P3‑mar"; navReasons.push(msg); navFails.push(msg);
-    }
-    if (category === "TANQUE") {
-      const valid = (pier === "P1" && side === "mar") || (pier === "P2" && side === "praia");
-      if (!valid) { navOK = false; const msg = "Tanque somente em P1‑mar ou P2‑praia"; navReasons.push(msg); navFails.push(msg); }
-    }
-
-    // Hs×Tp externo (mar aberto)
-    const canalRule = canalRuleFor(category, pier, side);
-    if (!canalRule) {
-      if (category === "TANQUE") { navOK = false; const msg = "Tanque fora dos berços válidos"; navReasons.push(msg); navFails.push(msg); }
-    } else if (!(nCanalHsExt <= canalRule.hs && nCanalTpExt <= canalRule.tp)) {
-      navOK = false; const msg = `Externo Hs×Tp excedido (limite ${canalRule.hs} m & ${canalRule.tp} s)`; navReasons.push(msg); navFails.push(msg);
-    }
-
-    // CMR/UKC por maré — porta de entrada
-    const cmrCanal = canalAcesso === 'sul' ? interpCMR(CMR_TABLE.canalSul, nMare) : interpCMR(CMR_TABLE.canalNorte, nMare);
-    const cmrBacia = interpCMR(CMR_TABLE.bacia, nMare);
-    const cmrPier = interpCMR(CMR_TABLE.piersNorte, nMare);
-    const cmrMin = Math.min(cmrCanal, cmrBacia, cmrPier);
-    if (nCalado > cmrMin) {
-      navOK = false; const msg = `CMR insuficiente: calado ${nCalado.toFixed(2)} m > CMR ${cmrMin.toFixed(2)} m (canal: ${cmrCanal} · bacia: ${cmrBacia} · píer: ${cmrPier})`;
-      navReasons.push(msg); navFails.push(msg);
-    }
-
-    // PERMANÊNCIA — interno
-    const perReasons = [];
-    const perFails = [];
-    let perOK = true;
-
-    // Vento (pior caso) e rajada teto
-    const ventoMedioWorst = Math.max(nVentoMedioInt, nVentoMedioExt);
-    const ventoRajadaWorst = Math.max(nVentoRajadaInt, nVentoRajadaExt);
-    const vmLim = ventoMedioLimite(category, pier, side, vizinhoOcupado);
-
-    if (vmLim == null) { perOK = false; const msg = "Berço não aplicável para a categoria"; perReasons.push(msg); perFails.push(msg); }
-    else if (ventoMedioWorst > vmLim) { perOK = false; const msg = `Vento médio (pior caso ${ventoMedioWorst} kn) > limite (${vmLim} kn)`; perReasons.push(msg); perFails.push(msg); }
-    if (ventoRajadaWorst > RAJADA_TETO) { perOK = false; const msg = `Rajada (pior caso ${ventoRajadaWorst} kn) > teto (${RAJADA_TETO} kn)`; perReasons.push(msg); perFails.push(msg); }
-
-    // Costados
-    if (vizinhoOcupado && !distCostadosOK) { perOK = false; const msg = "Distância entre costados < 10 m com vizinho ocupado"; perReasons.push(msg); perFails.push(msg); }
-
-    // On‑berth Hs×Tp — único Hs/Tp interno vs limite mais restritivo entre P1 e P1P
-    const limMerged = minPairCorrect(onP1Lim, onP1PLim);
-    const hsOk = (nHsInt <= limMerged.hs);
-    const tpOk = (nTpInt <= limMerged.tp);
-    if (!(hsOk && tpOk)) { perOK = false; const msg = `On‑berth interno Hs×Tp excedido (limite ${limMerged.hs} m & ${limMerged.tp} s)`; perReasons.push(msg); perFails.push(msg); }
-
-    // P3/Poita — notas operacionais
-    if (pier === "P3" && side === "praia") {
-      perReasons.push("P3‑praia com AHTS 18k: proibido conectar Poita (somente no píer)");
-      perReasons.push("P3‑praia: se LOA ≤ 82,4 m e houver manobra com P3‑mar, NÃO reconectar Poita após atracação do outro rebocador");
-    }
-
-    // Persistência temporal
-    if (!persistenciaOk) { perOK = false; const msg = "Persistência temporal insuficiente para cobrir a operação"; perReasons.push(msg); perFails.push(msg); }
-
-    // Consolidação
-    let status = "Go";
-    if (!navOK || !perOK) status = "No-Go";
-    else {
-      const near = [];
-      if (vmLim != null && Math.abs(vmLim - ventoMedioWorst) <= 1) near.push("Vento médio próximo ao limite");
-      if (Math.abs(RAJADA_TETO - ventoRajadaWorst) <= 1) near.push("Rajada próxima do teto");
-      if (canalRule && (Math.abs(canalRule.hs - nCanalHsExt) <= 0.1 || Math.abs(canalRule.tp - nCanalTpExt) <= 0.5)) near.push("Externo Hs×Tp próximo do limite");
-      if (Math.abs(limMerged.hs - nHsInt) <= 0.1 || Math.abs(limMerged.tp - nTpInt) <= 0.5) near.push("On‑berth interno Hs×Tp próximo do limite");
-      if (Math.abs(cmrMin - nCalado) <= 0.1) near.push("CMR próximo do calado");
-      if (near.length > 0) status = "Go com restrição";
-      perReasons.push("Mitigações padrão (se Go‑restrito): reforço de amarração, tugs stand‑by, vigilância de rajadas/onda, pausa de convés.");
-    }
-
-    return {
-      status,
-      navegacao: { ok: navOK, reasons: navReasons, fails: navFails, dados: { externo: { hs: nCanalHsExt, tp: nCanalTpExt }, cmr: { canal: cmrCanal, bacia: cmrBacia, pier: cmrPier, minimo: cmrMin, mare: nMare } } },
-      permanencia: { ok: perOK, reasons: perReasons, fails: perFails, dados: { interno: { P1P: { hs: nHsInt, tp: nTpInt } }, vento: { interno: { medio: nVentoMedioInt, rajada: nVentoRajadaInt }, externo: { medio: nVentoMedioExt, rajada: nVentoRajadaExt } } } }
-    };
-  }, [category,pier,side,arranjo,vizinhoOcupado,distCostadosOK,
-      ventoMedioExt,ventoRajadaExt,canalHsExt,canalTpExt,
-      ventoMedioInt,ventoRajadaInt,p1pHsInt,p1pTpInt,
-      isAHTS18k,loa,calado,canalAcesso,mare]);
-
-  // ---------- UI ----------
+// Texto numérico com parse/clamp no BLUR (corrige inputs meteo e evita travar digitação)
+function TextNumber({ value, onCommit, suffix, placeholder }){
+  const [txt,setTxt]=useState(value==null?'':String(value));
+  useEffect(()=>{ setTxt(value==null?'':String(value)); },[value]);
   return (
-    <div className="min-h-screen bg-slate-50">
-      {/* BARRA SUPERIOR — Decisão Geral na margem superior */}
-      <div className="sticky top-0 z-30 border-b border-slate-200 bg-white/90 backdrop-blur">
+    <div className="relative">
+      <input type="text" className="w-full border border-slate-300 rounded-lg px-3 py-2 pr-10 text-sm focus:outline-none focus:ring-2 focus:ring-blue-200" value={txt} placeholder={placeholder}
+        onChange={(e)=> setTxt(e.target.value)}
+        onBlur={()=>{
+          const n=parseFloat(String(txt).replace(',','.'));
+          if(Number.isFinite(n)) onCommit?.(n);
+        }} />
+      {suffix && <span className="absolute inset-y-0 right-2 flex items-center text-[11px] text-slate-500">{suffix}</span>}
+    </div>
+  );
+}
+const NumberInput = (props)=> <TextNumber {...props} />;
+
+// --------------- Tipos básicos ---------------
+function emptyMooring(){ return { heads:['Alfa','Bravo'], springs:['Charlie'], stern:['Delta','Echo'], notes:'' }; }
+
+// --------------- Catálogo IO (Export/Import) ---------------
+function CatalogIO({ catalog, setCatalog, compact }){
+  const fileRef = React.useRef(null);
+  const exportJSON = ()=>{
+    const blob=new Blob([JSON.stringify(catalog,null,2)],{type:'application/json'});
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');
+    a.href=url; a.download='catalog.json'; a.click(); URL.revokeObjectURL(url);
+  };
+  const importJSON = (e)=>{
+    const f=e.target.files?.[0]; if(!f) return; const r=new FileReader();
+    r.onload=()=>{ try{ const data=JSON.parse(String(r.result)); if(Array.isArray(data)){
+      const modeMerge = confirm('Importar catálogo: deseja MESCLAR com o atual? (OK = mesclar, Cancelar = substituir)');
+      if(modeMerge){
+        const map = new Map(catalog.map(it=> [String(it.name).toLowerCase(), {...it}]));
+        for(const it of data){ const k=String(it.name||'').toLowerCase(); if(!k) continue; map.set(k, { ...map.get(k), ...it }); }
+        setCatalog(Array.from(map.values()));
+      } else {
+        setCatalog(data);
+      }
+    } else alert('JSON inválido'); }catch{ alert('Falha ao ler JSON'); } };
+    r.readAsText(f);
+  };
+  return (
+    <div className={clsJoin('flex items-center gap-2', compact? '':'mb-0')}>
+      <input ref={fileRef} type="file" accept="application/json" className="hidden" onChange={importJSON} />
+      <SmallBtn onClick={exportJSON}>Exportar catálogo</SmallBtn>
+      <SmallBtn onClick={()=>fileRef.current?.click()}>Importar catálogo</SmallBtn>
+    </div>
+  );
+}
+
+// --------------- App ---------------
+export default function App(){
+  // Modais
+  const [catalogOpen,setCatalogOpen]=useState(false);
+
+  // GitHub cfg (para salvar sem pedir dados sempre)
+  const GH_LS_KEY='svnp_github_cfg_v1';
+  const [ghCfg,setGhCfg]=useState({ owner:'', repo:'', branch:'main', path:'public/catalog.json', pathVessels:'data/vessels.json', token:'' });
+  useEffect(()=>{ try{ const r=localStorage.getItem(GH_LS_KEY); if(r){ setGhCfg(JSON.parse(r)); } }catch{} },[]);
+  useEffect(()=>{ try{ localStorage.setItem(GH_LS_KEY, JSON.stringify(ghCfg)); }catch{} },[ghCfg]);
+
+  // Catálogo persistente (modelos salvos para autocomplete)
+  const [catalog,setCatalog]=useState([]);
+  useEffect(()=>{
+    try{
+      const raw=localStorage.getItem(CATALOG_LS_KEY);
+      if(raw){ setCatalog(JSON.parse(raw)); }
+      else {
+        // opcional: tentar carregar de /catalog.json se existir no repositório (public/)
+        fetch('/catalog.json').then(r=> r.ok? r.json(): null).then(d=>{ if(d && Array.isArray(d)) setCatalog(d); }).catch(()=>{});
+      }
+    }catch{}
+  },[]);
+  useEffect(()=>{ try{ localStorage.setItem(CATALOG_LS_KEY, JSON.stringify(catalog)); }catch{} },[catalog]);
+
+  // Estado global do ambiente
+  const [mare,setMare]=useState(0.6);
+  const [hsExt,setHsExt]=useState(1.0);
+  const [tpExt,setTpExt]=useState(10);
+  const [ventoInt,setVentoInt]=useState(12);
+  const [rajadaInt,setRajadaInt]=useState(18);
+  const [hsInt,setHsInt]=useState(0.8);
+  const [tpInt,setTpInt]=useState(10.5);
+
+  // Frota
+  const [vessels,setVessels]=useState([]);
+  const [selected,setSelected]=useState(null);
+  const [noteOpen,setNoteOpen]=useState(false);
+  const [noteText,setNoteText]=useState('');
+
+  // Canais reservados / ocupados
+  const [canalUse,setCanalUse]=useState({ norte:null, sul:null });
+
+  // Modal novo
+  const [newOpen,setNewOpen]=useState(false);
+  const [newDraft,setNewDraft]=useState({ name:'', loa:'', boa:'', draft:'', anchorZone:'alpha' });
+  const namePick = (val)=>{
+    const t = catalog.find(x=> String(x.name).toLowerCase()===String(val).toLowerCase());
+    setNewDraft(prev=>{
+      const next = { ...prev, name: val };
+      if(t){
+        next.loa = t.loa ?? '';
+        next.boa = t.boa ?? '';
+        next.draft = t.draft ?? '';
+        next.anchorZone = prevAnchorZoneSafe(t.anchorZone);
+      }
+      return next;
+    });
+  };
+  function prevAnchorZoneSafe(z){ return ['alpha','bravo','delta'].includes(String(z))? z : 'alpha'; }
+
+  // Contadores topo
+  const counts = useMemo(()=>{
+    const inZone = { alpha:0, bravo:0, delta:0 };
+    vessels.forEach(v=>{ if(v.state==='anchored') inZone[v.anchorZone]++; });
+    return inZone;
+  },[vessels]);
+
+  // --------- Decisor resumido (usa ambiente global + dados do navio/berço) ---------
+  function decideFor(v){
+    // NAV: canal Hs×Tp + CMR + restrições categoria/berço
+    let navOK=true; const navFails=[];
+    const rule = canalRuleFor(v.category, v.pier, v.side);
+    if(v.category==='A' && v.pier==='P3' && v.side==='mar'){ navOK=false; navFails.push('Cat. A não autorizado em P3-mar'); }
+    if(v.category==='T' && !((v.pier==='P1' && v.side==='mar')||(v.pier==='P2'&&v.side==='praia'))){ navOK=false; navFails.push('Tanque somente em P1-mar ou P2-praia'); }
+    if(rule){ if(!(hsExt<=rule.hs && tpExt<=rule.tp)){ navOK=false; navFails.push(`Canal Hs×Tp excedido (lim ${rule.hs} m / ${rule.tp} s)`); } }
+    else { navOK=false; navFails.push('Sem regra de canal aplicável'); }
+    const cmrCanal = v.canalPref==='sul'? interpCMR(CMR_TABLE.canalSul,mare) : interpCMR(CMR_TABLE.canalNorte,mare);
+    const cmrBacia = interpCMR(CMR_TABLE.bacia,mare);
+    const cmrPier  = interpCMR(CMR_TABLE.piersNorte,mare);
+    const cmrMin = Math.min(cmrCanal,cmrBacia,cmrPier);
+    if(parseFloat(v.draft||0) > cmrMin){ navOK=false; navFails.push(`CMR insuficiente: calado ${v.draft} m > ${cmrMin} m`);}    
+
+    // PERM: vento/rajada + ondas internas (usa limites on-berth presets simplificados)
+    let perOK=true; const perFails=[];
+    const vmLim = ventoMedioLimite(v.category,v.pier,v.side,!!v.neighborBusy);
+    const worstVm = Math.max(ventoInt, 0);
+    if(vmLim==null){ perOK=false; perFails.push('Berço não aplicável para a categoria'); }
+    else if(worstVm>vmLim){ perOK=false; perFails.push(`Vento médio ${worstVm} kn > ${vmLim} kn`);}    
+    if(Math.max(rajadaInt,0)>RAJADA_TETO){ perOK=false; perFails.push(`Rajada ${rajadaInt} kn > teto ${RAJADA_TETO} kn`);}    
+    // On-berth simplificado: P1/P1P limites agregados conforme categoria
+    const lim = (v.category==='A')? { hs:1.2, tp:12 } : (v.category==='B')? { hs:2.0, tp:12 } : (v.category==='C')? { hs:2.4, tp:12 } : { hs:1.5, tp:12 };
+    if(!(hsInt<=lim.hs && tpInt<=lim.tp)){ perOK=false; perFails.push(`On-berth interno Hs×Tp excedido (lim ${lim.hs} m / ${lim.tp} s)`);}    
+
+    let status = (navOK && perOK)? 'Go' : 'No-Go';
+    if(status==='Go'){
+      const near=[];
+      if(rule && (Math.abs(rule.hs-hsExt)<=0.1 || Math.abs(rule.tp-tpExt)<=0.5)) near.push('Canal próximo do limite');
+      if(Math.abs(lim.hs-hsInt)<=0.1 || Math.abs(lim.tp-tpInt)<=0.5) near.push('On-berth próximo do limite');
+      if(near.length) status='Go com restrição';
+    }
+    return { status, navOK, navFails, perOK, perFails, cmr:{ canal:cmrCanal, bacia:cmrBacia, pier:cmrPier, minimo:cmrMin } };
+  }
+
+  // --------- Nota técnica automática ---------
+  function buildNotaTecnica(v,dec){
+    const dt = new Date().toLocaleString();
+    const linhas = [];
+    linhas.push(`NOTA TÉCNICA — ${v.name}`);
+    linhas.push(`Data/Hora: ${dt}`);
+    linhas.push(`Situação: ${dec.status}`);
+    linhas.push('Resumo meteoceanográfico:');
+    linhas.push(`  Externo: Hs=${hsExt} m, Tp=${tpExt} s`);
+    linhas.push(`  Interno: Hs=${hsInt} m, Tp=${tpInt} s, Vento=${ventoInt} kn, Rajada=${rajadaInt} kn (teto=${RAJADA_TETO} kn)`);
+    linhas.push(`  Maré=${mare} m | CMR(min)=${dec.cmr.minimo} m (Canal ${dec.cmr.canal} / Bacia ${dec.cmr.bacia} / Píer ${dec.cmr.pier})`);
+    if(!dec.navOK){ linhas.push('Falhas de Navegação:'); dec.navFails.forEach(f=>linhas.push(`  - ${f}`)); }
+    if(!dec.perOK){ linhas.push('Falhas de Permanência:'); dec.perFails.forEach(f=>linhas.push(`  - ${f}`)); }
+    linhas.push('Recomendação:');
+    if(dec.status==='No-Go'){
+      if(!dec.navOK && !dec.perOK) linhas.push('  • Desaconselha-se entrada e permanência. Avaliar aguardar melhora ou saída segura.');
+      else if(!dec.navOK) linhas.push('  • Desaconselha-se a navegação/entrada neste momento.');
+      else linhas.push('  • Desaconselha-se a permanência atracada neste momento.');
+    } else if(dec.status==='Go com restrição') {
+      linhas.push('  • Proceder com restrições: reforço de amarração, tugs stand-by, vigilância de rajadas/onda, pausas de convés conforme necessário.');
+    } else {
+      linhas.push('  • Operação recomendada conforme critérios vigentes.');
+    }
+    return linhas.join('\n');
+  }
+
+  // --------- Handlers básicos ---------
+  function addVessel(){ setNewOpen(true); }
+  function saveNewVessel(){
+    const L=parseFloat(String(newDraft.loa).replace(',','.'));
+    const D=parseFloat(String(newDraft.draft).replace(',','.'));
+    if(!newDraft.name.trim()){ alert('Informe o nome da embarcação.'); return; }
+    if(!Number.isFinite(L) || L>MAX_LOA){ alert(`LOA inválido. Máx ${MAX_LOA} m.`); return; }
+    if(!Number.isFinite(D) || D>MAX_DRAFT){ alert(`Calado inválido. Máx ${MAX_DRAFT} m.`); return; }
+    const cat = autoCategory(newDraft.loa, newDraft.boa);
+    const id=Math.random().toString(36).slice(2,9);
+    const v={ id, name:newDraft.name.trim(), category:cat, loa:newDraft.loa, boa:newDraft.boa, draft:newDraft.draft, anchorZone:newDraft.anchorZone, state:'anchored', canalPref:'norte', pier:'P1', side:'praia', arranjo:1, neighborBusy:false, mooring:emptyMooring(), contrabordo:false };
+    setVessels(prev=>[...prev,v]); setSelected(id);
+    // atualizar/registrar no catálogo persistente
+    setCatalog(prev=>{
+      const idx = prev.findIndex(x=> String(x.name).toLowerCase()===v.name.toLowerCase());
+      const entry = { name:v.name, loa:v.loa, boa:v.boa, draft:v.draft, category:v.category };
+      if(idx>=0){ const clone=[...prev]; clone[idx]=entry; return clone; }
+      return [...prev, entry];
+    });
+    setNewOpen(false); setNewDraft({ name:'', loa:'', boa:'', draft:'', anchorZone:'alpha' });
+  }
+
+  function setVessel(id, patch){ setVessels(prev=> prev.map(x=> x.id===id? {...x, ...patch}: x)); }
+
+  // Canal reserva lógica (1 por canal; entrada e saída podem coexistir em canais distintos)
+  function reserveCanal(canalId, vesselId){
+    setCanalUse(prev=>{ if(prev[canalId] && prev[canalId]!==vesselId){ alert(`Canal ${canalId} já ocupado.`); return prev; } return {...prev, [canalId]:vesselId}; });
+    setVessel(vesselId,{ canalPref: canalId });
+  }
+  function freeCanal(canalId){ setCanalUse(prev=>({...prev,[canalId]:null})); }
+
+  // Atracação finalizando trânsito — 1 por píer (controle contra-bordo)
+  function finalizeBerth(v){
+    const samePier = vessels.filter(o=> o.state==='berthed' && o.pier===v.pier);
+    if(samePier.length>=1){
+      if(!confirm('Já existe embarcação no píer. Deseja atracar a contra-bordo?')) return;
+      setVessel(v.id,{ state:'berthed', contrabordo:true });
+    } else {
+      setVessel(v.id,{ state:'berthed', contrabordo:false });
+    }
+    if(canalUse[v.canalPref]===v.id) freeCanal(v.canalPref);
+  }
+
+  // ---------- Componentes ----------
+  const AnchTopCounters = ()=> (
+    <div className="grid grid-cols-3 gap-3">
+      {ANCH_ZONES.map(z=> (
+        <div key={z.id} className="bg-slate-50 border rounded-xl p-3 flex items-center justify-between">
+          <div className="text-sm text-slate-600">{z.label}</div>
+          <Pill tone="info" size="lg">{counts[z.id]}</Pill>
+        </div>
+      ))}
+    </div>
+  );
+
+  const MeteoCard = ()=> (
+    <Card title="Meteo & Hidro (Global)" desc="Externo e Interno; maré aplicada ao CMR">
+      <div className="grid grid-cols-1 md:grid-cols-12 gap-4">
+        <div className="md:col-span-3"><Label>Maré</Label><NumberInput value={mare} onCommit={setMare} suffix="m" /></div>
+        <div className="md:col-span-9 grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div className="border rounded-xl p-3">
+            <div className="font-medium text-slate-800 mb-2">Externo (Canal)</div>
+            <div className="grid grid-cols-2 gap-3">
+              <div><Label>Hs</Label><NumberInput value={hsExt} onCommit={setHsExt} suffix="m" /></div>
+              <div><Label>Tp</Label><NumberInput value={tpExt} onCommit={setTpExt} suffix="s" /></div>
+            </div>
+          </div>
+          <div className="border rounded-xl p-3">
+            <div className="font-medium text-slate-800 mb-2">Interno (Porto)</div>
+            <div className="grid grid-cols-2 gap-3">
+              <div><Label>Hs</Label><NumberInput value={hsInt} onCommit={setHsInt} suffix="m" /></div>
+              <div><Label>Tp</Label><NumberInput value={tpInt} onCommit={setTpInt} suffix="s" /></div>
+              <div><Label>Vento</Label><NumberInput value={ventoInt} onCommit={setVentoInt} suffix="kn" /></div>
+              <div><Label>Rajada</Label><NumberInput value={rajadaInt} onCommit={setRajadaInt} suffix="kn" /></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </Card>
+  );
+
+  const NewVesselModal = ()=> (
+    <Modal open={newOpen} onClose={()=>setNewOpen(false)} title="Cadastrar embarcação">
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        <div className="sm:col-span-2"><Label>Nome</Label>
+          <input list="vesselCatalog" className="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm" value={newDraft.name} onChange={e=>namePick(e.target.value)} placeholder="Digite o nome ou selecione"/>
+          <datalist id="vesselCatalog">
+            {catalog.map(t=> <option key={t.name} value={t.name} />)}
+          </datalist>
+        </div>
+        <div><Label>Comprimento (LOA)</Label><NumberInput value={newDraft.loa} onCommit={v=>setNewDraft({...newDraft,loa:v})} suffix="m"/></div>
+        <div><Label>Boca (BOA)</Label><NumberInput value={newDraft.boa} onCommit={v=>setNewDraft({...newDraft,boa:v})} suffix="m"/></div>
+        <div><Label>Calado</Label><NumberInput value={newDraft.draft} onCommit={v=>setNewDraft({...newDraft,draft:v})} suffix="m"/></div>
+        <div>
+          <Label>Área de Fundeio</Label>
+          <select className="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm" value={newDraft.anchorZone} onChange={e=>setNewDraft({...newDraft,anchorZone:e.target.value})}>
+            {ANCH_ZONES.map(z=><option key={z.id} value={z.id}>{z.label}</option>)}
+          </select>
+        </div>
+        <div className="sm:col-span-2">
+          <div className="text-xs text-slate-500 mb-2">Presets rápidos</div>
+          <div className="flex flex-wrap gap-2">
+            <SmallBtn onClick={()=>setNewDraft(d=>({ ...d, loa:75, boa:18, draft:6 }))}>PSV padrão</SmallBtn>
+            <SmallBtn onClick={()=>setNewDraft(d=>({ ...d, loa:82.4, boa:21, draft:7 }))}>AHTS 18k</SmallBtn>
+            <SmallBtn onClick={()=>setNewDraft(d=>({ ...d, loa:88.1, boa:14.82, draft:6.5 }))}>Tanque pequeno</SmallBtn>
+          </div>
+        </div>
+      </div>
+      <div className="mt-4 flex items-center justify-between gap-2">
+        <CatalogIO catalog={catalog} setCatalog={setCatalog} />
+        <div className="flex items-center gap-2">
+          <SmallBtn onClick={()=>setNewOpen(false)}>Cancelar</SmallBtn>
+          <SmallBtn tone="primary" onClick={saveNewVessel}>Salvar</SmallBtn>
+        </div>
+      </div>
+    </Modal>
+  );
+
+  const VesselRow = ({v})=>{
+    const [open,setOpen]=useState(false);
+    const dec = useMemo(()=>decideFor(v), [v, mare, hsExt,tpExt,hsInt,tpInt,ventoInt,rajadaInt]);
+    return (
+      <div className="border rounded-xl p-3">
+        <div className="flex items-center justify-between gap-3">
+          <div className="flex items-center gap-2">
+            <Pill tone={dec.status==='Go'?'ok':dec.status==='Go com restrição'?'warn':'bad'}>{dec.status}</Pill>
+            <div className="font-semibold text-slate-800">{v.name}</div>
+            <Pill tone="info" size="sm">{v.category}</Pill>
+          </div>
+          <div className="flex items-center gap-2">
+            <IconBtn title="Detalhes" onClick={()=>setOpen(!open)}>ℹ︎</IconBtn>
+          </div>
+        </div>
+        {open && (
+          <div className="mt-3 grid grid-cols-1 md:grid-cols-2 gap-3 text-sm">
+            <div className="space-y-2">
+              <div className="text-slate-600">LOA {v.loa} m · BOA {v.boa} m · Calado {v.draft} m</div>
+              <div className="text-slate-600">Estado: {v.state} · Fundeio: {v.anchorZone?.toUpperCase()}</div>
+              <div className="text-slate-600">Destino: {v.pier}/{v.side}</div>
+              <div className="flex gap-2 flex-wrap">
+                {v.state==='anchored' && <SmallBtn tone="primary" onClick={()=>setVessel(v.id,{ state:'queued' })}>Chamar para atracação</SmallBtn>}
+                {v.state==='queued' && (
+                  <>
+                    <select className="border rounded-lg px-2 py-1 text-sm" value={v.canalPref} onChange={e=>reserveCanal(e.target.value,v.id)}>{CANAIS.map(c=><option key={c.id} value={c.id}>{c.label}</option>)}</select>
+                    <select className="border rounded-lg px-2 py-1 text-sm" value={v.pier} onChange={e=>setVessel(v.id,{ pier:e.target.value })}>{PIERS.map(p=><option key={p.id} value={p.id}>{p.label}</option>)}</select>
+                    <select className="border rounded-lg px-2 py-1 text-sm" value={v.side} onChange={e=>setVessel(v.id,{ side:e.target.value })}>{SIDES.map(s=><option key={s.id} value={s.id}>{s.label}</option>)}</select>
+                    <SmallBtn tone="success" onClick={()=>setVessel(v.id,{ state:'transiting' })}>Autorizar entrada</SmallBtn>
+                  </>
+                )}
+                {v.state==='transiting' && (
+                  <>
+                    <SmallBtn tone="success" onClick={()=>finalizeBerth(v)}>Finalizar atracação</SmallBtn>
+                    <SmallBtn onClick={()=>{ if(canalUse[v.canalPref]===v.id) freeCanal(v.canalPref); setVessel(v.id,{ state:'anchored' }); }}>Cancelar</SmallBtn>
+                  </>
+                )}
+                {v.state==='berthed' && (
+                  <>
+                    <SmallBtn onClick={()=>setVessel(v.id,{ state:'departing' })}>Preparar saída</SmallBtn>
+                  </>
+                )}
+                {v.state==='departing' && (
+                  <>
+                    <select className="border rounded-lg px-2 py-1 text-sm" value={v.canalPref} onChange={e=>reserveCanal(e.target.value,v.id)}>{CANAIS.map(c=><option key={c.id} value={c.id}>{c.label}</option>)}</select>
+                    <SmallBtn tone="danger" onClick={()=>{ if(canalUse[v.canalPref]===v.id) freeCanal(v.canalPref); setVessel(v.id,{ state:'done' }); }}>Zarpar</SmallBtn>
+                  </>
+                )}
+                {dec.status==='No-Go' ? (
+                  <SmallBtn tone="danger" onClick={()=>{ const nota=buildNotaTecnica(v,dec); setNoteText(nota); setNoteOpen(true); }}>Nota técnica</SmallBtn>
+                ) : (
+                  <span className="inline-flex items-center px-3 py-1.5 rounded-lg bg-slate-200 text-slate-600 cursor-not-allowed select-none">Nota técnica</span>
+                )}
+              </div>
+            </div>
+            <div className="space-y-1 text-xs text-slate-600">
+              {!dec.navOK && (<div className="text-rose-700"><b>Navegação NÃO OK:</b><ul className="list-disc pl-5">{dec.navFails.map((f,i)=><li key={i}>{f}</li>)}</ul></div>)}
+              {!dec.perOK && (<div className="text-rose-700"><b>Permanência NÃO OK:</b><ul className="list-disc pl-5">{dec.perFails.map((f,i)=><li key={i}>{f}</li>)}</ul></div>)}
+              {dec.navOK && dec.perOK && <div><b>Critérios atendidos.</b></div>}
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  const AnchorageBoard = ()=> (
+    <Card title="Fundeios" desc="Gerencie embarcações em Alpha, Bravo e Delta">
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+        {ANCH_ZONES.map(z=> (
+          <div key={z.id} className="bg-slate-50 border rounded-xl p-3">
+            <div className="flex items-center justify-between mb-2"><div className="font-semibold">{z.label}</div><Pill tone="info">{counts[z.id]}</Pill></div>
+            <div className="space-y-2">
+              {vessels.filter(v=>v.state==='anchored' && v.anchorZone===z.id).map(v=> (<VesselRow key={v.id} v={v}/>))}
+              {vessels.filter(v=>v.state==='anchored' && v.anchorZone===z.id).length===0 && <div className="text-xs text-slate-500">Sem embarcações.</div>}
+            </div>
+          </div>
+        ))}
+      </div>
+    </Card>
+  );
+
+  const QueueBoard = ()=> (
+    <Card title="Chamadas para Atracação" desc="Fila e reserva de canais">
+      <div className="space-y-2">
+        {vessels.filter(v=>v.state==='queued'||v.state==='transiting').map(v=> (<VesselRow key={v.id} v={v}/>))}
+        {vessels.filter(v=>v.state==='queued'||v.state==='transiting').length===0 && <div className="text-xs text-slate-500">Nenhuma embarcação na fila.</div>}
+      </div>
+      <div className="mt-4 grid grid-cols-2 gap-3 text-sm">
+        {CANAIS.map(c=> (
+          <div key={c.id} className="border rounded-xl p-3 flex items-center justify-between"><div>{c.label}</div><Pill tone={canalUse[c.id]? 'warn':'ok'}>{canalUse[c.id]? 'Ocupado':'Livre'}</Pill></div>
+        ))}
+      </div>
+    </Card>
+  );
+
+  const NoteModal = ()=> (
+    <Modal open={noteOpen} onClose={()=>setNoteOpen(false)} title="Nota técnica">
+      <div className="space-y-3">
+        <textarea readOnly className="w-full h-56 border rounded-lg p-2 text-sm font-mono" value={noteText} />
+        <div className="flex items-center justify-end gap-2">
+          <SmallBtn onClick={()=>{ navigator.clipboard?.writeText(noteText); alert('Nota copiada.'); }}>Copiar</SmallBtn>
+          <SmallBtn tone="primary" onClick={()=>setNoteOpen(false)}>Fechar</SmallBtn>
+        </div>
+      </div>
+    </Modal>
+  );
+
+  const PiersBoard = ()=> (
+    <Card title="Píeres" desc="Estado atual dos berços">
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+        {PIERS.map(p=> (
+          <div key={p.id} className="bg-slate-50 border rounded-xl p-3">
+            <div className="font-semibold mb-2">{p.label}</div>
+            <div className="space-y-2">
+              {vessels.filter(v=>v.state==='berthed' && v.pier===p.id).map(v=> (<VesselRow key={v.id} v={v}/>))}
+              {vessels.filter(v=>v.state==='berthed' && v.pier===p.id).length===0 && <div className="text-xs text-slate-500">Vazio</div>}
+            </div>
+          </div>
+        ))}
+      </div>
+    </Card>
+  );
+
+  const HeaderBar = ()=> {
+    const overall = useMemo(()=>{
+      const sample = vessels.filter(v=> ['queued','transiting','berthed'].includes(v.state));
+      if(sample.length===0) return 'Go';
+      let hasWarn=false; for(const v of sample){ const d=decideFor(v); if(d.status==='No-Go') return 'No-Go'; if(d.status==='Go com restrição') hasWarn=true; }
+      return hasWarn? 'Go com restrição':'Go';
+    },[vessels, mare, hsExt,tpExt,hsInt,tpInt,ventoInt,rajadaInt]);
+
+    async function quickGithubSave(){
+      const {owner,repo,branch,pathVessels,token}=ghCfg||{};
+      if(!owner||!repo||!pathVessels||!token){
+        alert('Configure o GitHub (owner/repo/path/token) antes de salvar.');
+        return;
+      }
+      try{
+        const api = `https://api.github.com/repos/${owner}/${repo}/contents/${encodeURIComponent(pathVessels)}`;
+        // obter sha (se existir)
+        let sha=null; try{ const r=await fetch(api+`?ref=${encodeURIComponent(branch||'main')}`); if(r.ok){ const j=await r.json(); sha=j.sha; } }catch{}
+        const payload = { vessels };
+        const content = btoa(unescape(encodeURIComponent(JSON.stringify(payload,null,2))));
+        const put = await fetch(api,{ method:'PUT', headers:{ 'Authorization':`Bearer ${token}`, 'Content-Type':'application/json' }, body: JSON.stringify({ message:`chore: update vessels (${new Date().toISOString()})`, branch:branch||'main', content, sha }) });
+        if(!put.ok){ const t=await put.text(); throw new Error(t); }
+        alert('Dados das embarcações salvos no GitHub com sucesso.');
+      }catch(e){ alert('Falha ao salvar no GitHub: '+(e?.message||e)); }
+    }
+
+    return (
+      <div className="border-b border-slate-200 bg-white/80 backdrop-blur">
         <div className="mx-auto max-w-7xl px-6 py-4 flex items-center justify-between">
           <div className="flex items-center gap-3">
             <h1 className="text-lg md:text-2xl font-bold text-slate-900">SVNP‑Imbetiba</h1>
-            <span className="hidden md:inline-block text-xs text-slate-500">Decisor • Navegação × Permanência</span>
+            <span className="hidden md:inline-block text-xs text-slate-500">Centro Operacional · v2.0</span>
           </div>
-          <div>
-            <Pill size="lg" tone={
-              decision.status === 'Go' ? 'ok' :
-              decision.status === 'Go com restrição' ? 'warn' : 'bad'
-            }>{decision.status}</Pill>
+          <div className="flex items-center gap-2 flex-wrap">
+            <SmallBtn onClick={()=>setCatalogOpen(true)}>Gerir catálogo</SmallBtn>
+            <SmallBtn tone="primary" onClick={quickGithubSave}>Salvar dados (GitHub)</SmallBtn>
+            <CatalogIO catalog={catalog} setCatalog={setCatalog} compact />
+            <SmallBtn tone="primary" onClick={addVessel}>+ Adicionar embarcação</SmallBtn>
+            <Pill size="lg" tone={overall==='Go'?'ok':overall==='Go com restrição'?'warn':'bad'}>{overall}</Pill>
           </div>
         </div>
       </div>
+    );
+  };
 
-      {/* GRID PRINCIPAL */}
-      <div className="mx-auto max-w-7xl px-6 py-6 grid grid-cols-1 lg:grid-cols-12 gap-6">
-        {/* PRIMEIRA LINHA: Meteo & Hidro (esq) + Navio/Berço/Canal/Maré (dir) */}
-        <div className="lg:col-span-12 grid grid-cols-1 lg:grid-cols-12 gap-6">
-          {/* Meteo & Hidro */}
-          <div className="lg:col-span-6">
-            <Card title="Meteo & Hidro (único)" desc="Externo e Interno lado a lado; Canal/Maré estão no card ao lado.">
-              <div className="flex flex-col gap-6 w-full">
-                <div className="flex flex-wrap gap-6 w-full">
-                  {/* Externo */}
-                  <div className="flex-1 min-w-[460px] border rounded-xl p-4">
-                    <h3 className="font-medium text-slate-800 mb-3">Externo</h3>
-                    <div className="flex flex-wrap gap-4">
-                      <div className="flex-1 min-w-[150px]"><Label>Hs externo</Label><NumberInput value={canalHsExt} onChange={setCanalHsExt} step={0.01} suffix="m" placeholder="ex.: 1.2" /></div>
-                      <div className="flex-1 min-w-[150px]"><Label>Tp externo</Label><NumberInput value={canalTpExt} onChange={setCanalTpExt} step={0.1} suffix="s" placeholder="ex.: 10" /></div>
-                      <div className="flex-1 min-w-[150px]"><Label>Vento médio</Label><NumberInput value={ventoMedioExt} onChange={setVentoMedioExt} suffix="kn" placeholder="ex.: 12" /></div>
-                      <div className="flex-1 min-w-[150px]"><Label>Rajada</Label><NumberInput value={ventoRajadaExt} onChange={setVentoRajadaExt} suffix="kn" placeholder="ex.: 18" /></div>
-                    </div>
-                  </div>
-                  {/* Interno */}
-                  <div className="flex-1 min-w-[460px] border rounded-xl p-4">
-                    <h3 className="font-medium text-slate-800 mb-3">Interno — Porto</h3>
-                    <div className="flex flex-wrap gap-4">
-                      <div className="flex-1 min-w-[150px]"><Label>Hs interno</Label><NumberInput value={p1pHsInt} onChange={setP1pHsInt} step={0.01} suffix="m" placeholder="ex.: 0.12" /></div>
-                      <div className="flex-1 min-w-[150px]"><Label>Tp interno</Label><NumberInput value={p1pTpInt} onChange={setP1pTpInt} step={0.1} suffix="s" placeholder="ex.: 10.5" /></div>
-                      <div className="flex-1 min-w-[150px]"><Label>Vento médio interno</Label><NumberInput value={ventoMedioInt} onChange={setVentoMedioInt} suffix="kn" placeholder="ex.: 12" /></div>
-                      <div className="flex-1 min-w-[150px]"><Label>Rajada interna</Label><NumberInput value={ventoRajadaInt} onChange={setVentoRajadaInt} suffix="kn" placeholder="ex.: 18" /></div>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            </Card>
-          </div>
+  // --------------- Render ---------------
+  return (
+    <div className="min-h-screen bg-slate-50">
+      <HeaderBar />
+      <div className="mx-auto max-w-7xl px-6 py-6 space-y-6">
+        <AnchTopCounters />
+        {/* Fundeios e Píeres logo após os contadores */}
+        <AnchorageBoard />
+        <PiersBoard />
+        {/* Meteo depois dos quadros operacionais de posição */}
+        <MeteoCard />
+        {/* Fila de atracação e canais */}
+        <QueueBoard />
+      </div>
+      <NewVesselModal />
+      <NoteModal />
+      {catalogOpen && <CatalogManagerModal onClose={()=>setCatalogOpen(false)} catalog={catalog} setCatalog={setCatalog} />}
+    </div>
+  );
+}
 
-          {/* Navio, Berço & Canal/Maré */}
-          <div className="lg:col-span-6">
-            <Card title="Navio, Berço & Canal/Maré" desc="Fluxo: Navio → Berço → Acesso (CMR)">
-              <div className="space-y-6">
-                {/* Navio */}
-                <div className="border border-slate-200 rounded-xl p-4 bg-slate-50/50">
-                  <div className="flex items-center gap-2 mb-3">
-                    <div className="h-2 w-2 rounded-full bg-slate-400"></div>
-                    <h3 className="text-sm font-semibold text-slate-800">Navio</h3>
-                  </div>
-                  <div className="grid grid-cols-1 md:grid-cols-12 gap-3">
-                    <div className="md:col-span-4">
-                      <Label>Categoria</Label>
-                      <select className="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm" value={category} onChange={e=>setCategory(e.target.value)}>
-                        {CATEGORIES.map(c=> <option key={c.id} value={c.id}>{c.label}</option>)}
-                      </select>
-                    </div>
-                    <div className="md:col-span-2">
-                      <Label hint="Comprimento total">LOA</Label>
-                      <NumberInput value={loa} onChange={setLoa} suffix="m" placeholder="ex.: 100" />
-                    </div>
-                    <div className="md:col-span-2">
-                      <Label hint="Boca (largura)">BOA</Label>
-                      <NumberInput value={boa} onChange={setBoa} suffix="m" placeholder="ex.: 20" />
-                    </div>
-                    <div className="md:col-span-2">
-                      <Label>Calado</Label>
-                      <NumberInput value={calado} onChange={setCalado} suffix="m" placeholder="ex.: 7.5" />
-                    </div>
-                    <div className="md:col-span-2 flex items-end">
-                      <label className="inline-flex items-center gap-2 text-sm"><input type="checkbox" checked={isAHTS18k} onChange={e=>setIsAHTS18k(e.target.checked)} />AHTS 18k</label>
-                    </div>
-                  </div>
-                </div>
-
-                {/* Berço */}
-                <div className="border border-slate-200 rounded-xl p-4 bg-slate-50/50">
-                  <div className="flex items-center gap-2 mb-3">
-                    <div className="h-2 w-2 rounded-full bg-blue-400"></div>
-                    <h3 className="text-sm font-semibold text-slate-800">Berço</h3>
-                  </div>
-                  <div className="grid grid-cols-1 md:grid-cols-12 gap-3">
-                    <div className="md:col-span-3">
-                      <Label>Píer</Label>
-                      <select className="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm" value={pier} onChange={e=>setPier(e.target.value)}>
-                        {PIERS.map(p=> <option key={p.id} value={p.id}>{p.label}</option>)}
-                      </select>
-                    </div>
-                    <div className="md:col-span-3">
-                      <Label>Lado</Label>
-                      <select className="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm" value={side} onChange={e=>setSide(e.target.value)}>
-                        {SIDES.map(s=> <option key={s.id} value={s.id}>{s.label}</option>)}
-                      </select>
-                    </div>
-                    <div className="md:col-span-4">
-                      <Label>Arranjo de amarração</Label>
-                      <select className="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm" value={arranjo} onChange={e=>setArranjo(parseInt(e.target.value))}>
-                        {[1,2,3,4].map(n=> <option key={n} value={n}>Arranjo {n}</option>)}
-                      </select>
-                    </div>
-                    <div className="md:col-span-2 flex items-end">
-                      <label className="inline-flex items-center gap-2 text-sm"><input type="checkbox" checked={vizinhoOcupado} onChange={e=>setVizinhoOcupado(e.target.checked)} />Vizinho ocupado (≥10 m)</label>
-                    </div>
-                  </div>
-                  {vizinhoOcupado && (
-                    <div className="mt-2">
-                      <label className="inline-flex items-center gap-2 text-sm"><input type="checkbox" checked={distCostadosOK} onChange={e=>setDistCostadosOK(e.target.checked)} />Confirmo distância ≥ 10 m</label>
-                    </div>
-                  )}
-                </div>
-
-                {/* Acesso (Canal/Maré/CMR) */}
-                <div className="border border-slate-200 rounded-xl p-4 bg-slate-50/50">
-                  <div className="flex items-center gap-2 mb-3">
-                    <div className="h-2 w-2 rounded-full bg-emerald-400"></div>
-                    <h3 className="text-sm font-semibold text-slate-800">Acesso (Canal/Maré)</h3>
-                  </div>
-                  <div className="grid grid-cols-1 md:grid-cols-12 gap-3 items-end">
-                    <div className="md:col-span-4">
-                      <Label>Canal de acesso</Label>
-                      <select className="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm" value={canalAcesso} onChange={e=>setCanalAcesso(e.target.value)}>
-                        {CANAIS.map(c=> <option key={c.id} value={c.id}>{c.label}</option>)}
-                      </select>
-                    </div>
-                    <div className="md:col-span-3">
-                      <Label hint="Nível instantâneo (referência local)">Maré</Label>
-                      <NumberInput value={mare} onChange={setMare} step={0.01} suffix="m" placeholder="ex.: 0.6" />
-                    </div>
-                    <div className="md:col-span-5">
-                      <div className="bg-white border rounded-xl p-3">
-                        <div className="flex items-center justify-between">
-                          <div className="text-[12px] font-semibold text-slate-700">CMR calculado</div>
-                          <Pill size="md" tone="info">mín {canalAcesso==='sul'? interpCMR(CMR_TABLE.canalSul, parseFloat(mare)||0):interpCMR(CMR_TABLE.canalNorte, parseFloat(mare)||0)} / {interpCMR(CMR_TABLE.bacia, parseFloat(mare)||0)} / {interpCMR(CMR_TABLE.piersNorte, parseFloat(mare)||0)} m</Pill>
-                        </div>
-                        <div className="text-[12px] text-slate-600 mt-1">Canal · Bacia · Píer — menor valor como gate</div>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            </Card>
-          </div>
+// --------------- Catálogo: edição direta ---------------
+function CatalogManagerModal({ onClose, catalog, setCatalog }){
+  const [rows,setRows]=useState(catalog.map((r,i)=>({ ...r, _id: i })));
+  useEffect(()=>{ setRows(catalog.map((r,i)=>({ ...r, _id: i }))); },[catalog]);
+  const addRow=()=> setRows(prev=>[...prev,{ _id: Math.random().toString(36).slice(2,7), name:'', loa:'', boa:'', draft:'', category:'B' }]);
+  const delRow=(rid)=> setRows(prev=> prev.filter(r=> r._id!==rid));
+  const saveAll=()=>{
+    // normaliza e salva
+    const out = rows.filter(r=> String(r.name).trim()).map(r=> ({ name:String(r.name).trim(), loa:r.loa, boa:r.boa, draft:r.draft, category:r.category }));
+    setCatalog(out); onClose();
+  };
+  return (
+    <Modal open={true} onClose={onClose} title="Gerir catálogo de embarcações">
+      <div className="space-y-3">
+        <div className="text-xs text-slate-500">Edite diretamente os modelos salvos. Estas alterações atualizam a base local imediatamente ao salvar.</div>
+        <div className="overflow-x-auto">
+          <table className="min-w-full text-sm">
+            <thead>
+              <tr className="text-left text-slate-600">
+                <th className="py-2 pr-3">Nome</th>
+                <th className="py-2 pr-3">LOA</th>
+                <th className="py-2 pr-3">BOA</th>
+                <th className="py-2 pr-3">Calado</th>
+                <th className="py-2 pr-3">Categoria</th>
+                <th className="py-2 pr-3"></th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map(r=> (
+                <tr key={r._id} className="border-t">
+                  <td className="py-2 pr-3"><input className="border rounded px-2 py-1 w-full" value={r.name} onChange={e=> setRows(rows=> rows.map(x=> x._id===r._id? {...x,name:e.target.value}:x))} /></td>
+                  <td className="py-2 pr-3"><input className="border rounded px-2 py-1 w-24" value={r.loa} onChange={e=> setRows(rows=> rows.map(x=> x._id===r._id? {...x,loa:e.target.value}:x))} /></td>
+                  <td className="py-2 pr-3"><input className="border rounded px-2 py-1 w-24" value={r.boa} onChange={e=> setRows(rows=> rows.map(x=> x._id===r._id? {...x,boa:e.target.value}:x))} /></td>
+                  <td className="py-2 pr-3"><input className="border rounded px-2 py-1 w-24" value={r.draft} onChange={e=> setRows(rows=> rows.map(x=> x._id===r._id? {...x,draft:e.target.value}:x))} /></td>
+                  <td className="py-2 pr-3">
+                    <select className="border rounded px-2 py-1" value={r.category} onChange={e=> setRows(rows=> rows.map(x=> x._id===r._id? {...x,category:e.target.value}:x))}>
+                      <option value="A">A</option>
+                      <option value="B">B</option>
+                      <option value="C">C</option>
+                      <option value="T">T</option>
+                    </select>
+                  </td>
+                  <td className="py-2 pr-3 text-right"><SmallBtn onClick={()=>delRow(r._id)}>Remover</SmallBtn></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </div>
-
-        {/* SEGUNDA LINHA: Navegação & Permanência */}
-        <div className="lg:col-span-12">
-          <Card title="Navegação & Permanência" desc="Detalhamento por fase e itens NÃO atendidos.">
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-              <div>
-                <div className="flex items-center justify-between mb-2">
-                  <h3 className="font-medium text-slate-800">Navegação (Entrada)</h3>
-                  <Pill size="md" tone={decision.navegacao.ok ? 'ok' : 'bad'}>{decision.navegacao.ok ? 'OK' : 'NÃO OK'}</Pill>
-                </div>
-                {decision.navegacao.fails.length > 0 && (
-                  <div className="mb-2">
-                    <div className="text-xs font-semibold text-rose-700">Itens NÃO atendidos</div>
-                    <ul className="list-disc pl-5 text-sm text-rose-700">{decision.navegacao.fails.map((r, i) => (<li key={i}>{r}</li>))}</ul>
-                  </div>
-                )}
-                <div className="text-xs text-slate-600 mt-2 space-y-1">
-                  <div><span className="font-semibold">Externo:</span> Hs={decision.navegacao.dados.externo.hs} m · Tp={decision.navegacao.dados.externo.tp} s</div>
-                  <div><span className="font-semibold">CMR:</span> mín={decision.navegacao.dados.cmr.minimo} m (canal {decision.navegacao.dados.cmr.canal} · bacia {decision.navegacao.dados.cmr.bacia} · píer {decision.navegacao.dados.cmr.pier}) · maré={decision.navegacao.dados.cmr.mare} m</div>
-                  <div>NPCP: 1 navio/vez · SOG≤5 · sem DP/testes/piloto/fundeio · UKC/CMR OK · AP/DELTA OK</div>
-                </div>
-              </div>
-              <div>
-                <div className="flex items-center justify-between mb-2">
-                  <h3 className="font-medium text-slate-800">Permanência (On‑Berth)</h3>
-                  <Pill size="md" tone={decision.permanencia.ok ? 'ok' : 'bad'}>{decision.permanencia.ok ? 'OK' : 'NÃO OK'}</Pill>
-                </div>
-                {decision.permanencia.fails.length > 0 && (
-                  <div className="mb-2">
-                    <div className="text-xs font-semibold text-rose-700">Itens NÃO atendidos</div>
-                    <ul className="list-disc pl-5 text-sm text-rose-700">{decision.permanencia.fails.map((r, i) => (<li key={i}>{r}</li>))}</ul>
-                  </div>
-                )}
-                <div className="grid grid-cols-2 gap-3 text-xs text-slate-600 mt-2">
-                  <div>
-                    <div className="font-semibold">Ondas internas</div>
-                    <div>Hs={decision.permanencia.dados.interno.P1P.hs} m · Tp={decision.permanencia.dados.interno.P1P.tp} s</div>
-                  </div>
-                  <div>
-                    <div className="font-semibold">Vento</div>
-                    <div>Interno: médio={decision.permanencia.dados.vento.interno.medio} kn · rajada={decision.permanencia.dados.vento.interno.rajada} kn</div>
-                    <div>Externo: médio={decision.permanencia.dados.vento.externo.medio} kn · rajada={decision.permanencia.dados.vento.externo.rajada} kn</div>
-                    <div className="mt-1">Regra: usa‑se o <em>pior caso</em> para vento/rajada. Teto de rajada = {RAJADA_TETO} kn.</div>
-                  </div>
-                </div>
-                <div className="text-[11px] text-slate-500 mt-2">Notas operacionais: P3/Poita, LOA ≤ 82,4 m e AHTS 18k são avaliados automaticamente.</div>
-              </div>
-            </div>
-          </Card>
+        <div className="flex items-center justify-between">
+          <SmallBtn onClick={addRow}>+ Adicionar linha</SmallBtn>
+          <div className="flex items-center gap-2">
+            <SmallBtn onClick={onClose}>Cancelar</SmallBtn>
+            <SmallBtn tone="primary" onClick={saveAll}>Salvar alterações</SmallBtn>
+          </div>
         </div>
       </div>
+    </Modal>
+  );
+}
 
-      {/* Barra fixa inferior (resumo rápido) */}
-      <div className="sticky bottom-0 inset-x-0 border-t border-slate-200 bg-white/90 backdrop-blur">
-        <div className="mx-auto max-w-7xl px-6 py-3 flex items-center justify-between gap-4">
-          <div className="text-xs text-slate-500">v0.92 — Base limpa para consulta + funcionamento validado</div>
-          <div>
-            <Pill size="lg" tone={
-              decision.status === 'Go' ? 'ok' :
-              decision.status === 'Go com restrição' ? 'warn' : 'bad'
-            }>{decision.status}</Pill>
-          </div>
+// --------------- Modal infra ---------------
+function Modal({ open, onClose, title, children }){
+  if(!open) return null;
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center">
+      <div className="absolute inset-0 bg-black/30" onClick={onClose} />
+      <div className="relative bg-white rounded-2xl shadow-xl w-[min(760px,95vw)]">
+        <div className="p-4 border-b border-slate-100 flex items-center justify-between">
+          <h3 className="font-semibold text-slate-900">{title}</h3>
+          <button onClick={onClose} className="text-slate-500 hover:text-slate-700">✕</button>
         </div>
+        <div className="p-4">{children}</div>
       </div>
     </div>
   );
