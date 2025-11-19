@@ -179,8 +179,8 @@ export default function Component() {
   async function importFromGitHub() {
     try {
       setSyncStatus("loading");
-      const res = await fetch("/api/vessels");
-      if (!res.ok) throw new Error("Falha ao ler /api/vessels");
+      const res = await fetch("data/vessels");
+      if (!res.ok) throw new Error("Falha ao ler data/vessels");
       const json = await res.json();
       if (Array.isArray(json.data)) {
         setVesselDB(json.data);
@@ -201,13 +201,13 @@ export default function Component() {
   async function saveToGitHub() {
     try {
       setSyncStatus("saving");
-      const res = await fetch("/api/vessels", {
+      const res = await fetch("/data/vessels", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ data: vesselDB, sha: githubSha }),
       });
 
-      if (!res.ok) throw new Error("Falha ao salvar /api/vessels");
+      if (!res.ok) throw new Error("Falha ao salvar /data/vessels");
 
       const json = await res.json();
       if (json.sha) setGithubSha(json.sha);
