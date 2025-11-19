@@ -88,7 +88,7 @@ export default function Component() {
   // Embarcação em avaliação
   const [vessel, setVessel] = useState({
     name: "",
-    category: "A",
+    category: "",
     loa: "",
     draft: "",
     beam: "",
@@ -364,7 +364,7 @@ export default function Component() {
                   >
                     <option>Enchente</option>
                     <option>Vazante</option>
-                    <option>Estofa</option>
+                    <option>Preamar</option>
                   </select>
                 </div>
               </div>
