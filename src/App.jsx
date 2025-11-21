@@ -1,16 +1,15 @@
 import React, { useState, useMemo, useEffect } from "react";
 
 /**
- * SVNP-Imbetiba — V3.3 (GO/NO-GO + Base + GitHub Manual Sync)
+ * SVNP-Imbetiba — V3.4
  * -------------------------------------------------------------------
  * ✔ Foco principal: GO / NO-GO (metoceanografia + dados da embarcação)
  * ✔ Aba "Base de Embarcações" com listagem dos registros
- * ✔ Cadastro: Nome, Categoria, LOA, Boca, Calado
- * ✔ Autocomplete de embarcações cadastradas
- * ✔ Nota Técnica: renderizada em tela, com opção de imprimir
- * ✔ NOVO: Botões na aba de Base para
- *      • Importar lista do GitHub (GET /api/vessels)
- *      • Salvar lista no GitHub (PUT /api/vessels)
+ * ✔ Cadastro somente na aba de Base (botão "Adicionar embarcação" + popup)
+ * ✔ Tela principal: seleção de embarcações em até 6 posições (P1/P2/P3 · praia/mar)
+ * ✔ Cada posição avaliada individualmente com base nas condições meteoceanográficas
+ * ✔ Nota Técnica de NO-GO por embarcação/posição, renderizada em tela
+ * ✔ Integração manual com GitHub (Importar / Salvar) na aba de Base
  */
 
 // ------------------- Regras -------------------
@@ -32,6 +31,15 @@ const LIMITS = {
     Tanque: { hs: 1.5, tp: 9 },
   },
 };
+
+const PIER_SLOTS = [
+  { id: "P1P", label: "Píer 1 — Lado Praia" },
+  { id: "P1M", label: "Píer 1 — Lado Mar" },
+  { id: "P2P", label: "Píer 2 — Lado Praia" },
+  { id: "P2M", label: "Píer 2 — Lado Mar" },
+  { id: "P3P", label: "Píer 3 — Lado Praia" },
+  { id: "P3M", label: "Píer 3 — Lado Mar" },
+];
 
 function goNoGo(vessel, meto, depth) {
   if (!vessel) return null;
@@ -73,7 +81,7 @@ function goNoGo(vessel, meto, depth) {
 
 // ------------------- Componente -------------------
 export default function Component() {
-  // Metoceanografia
+  // Metoceanografia (comuns a todas as embarcações)
   const [meto, setMeto] = useState({
     sector: "Interno",
     wind: 15,
@@ -85,17 +93,26 @@ export default function Component() {
 
   const [depth, setDepth] = useState(10.5);
 
-  // Embarcação em avaliação
-  const [vessel, setVessel] = useState({
-    name: "",
-    category: "",
-    loa: "",
-    draft: "",
-    beam: "",
-  });
-
   // Base de embarcações cadastradas
   const [vesselDB, setVesselDB] = useState([]); // {id,name,category,loa,draft,beam}
+
+  // Atribuições por píer (cada posição guarda o id da embarcação ou "")
+  const [berthAssignments, setBerthAssignments] = useState(() => {
+    const initial = {};
+    PIER_SLOTS.forEach((slot) => {
+      initial[slot.id] = "";
+    });
+    return initial;
+  });
+
+  // Texto de busca por píer (para digitar o nome e filtrar a base)
+  const [berthSearch, setBerthSearch] = useState(() => {
+    const initial = {};
+    PIER_SLOTS.forEach((slot) => {
+      initial[slot.id] = "";
+    });
+    return initial;
+  });
 
   // Controle GitHub
   const [githubSha, setGithubSha] = useState(null);
@@ -104,8 +121,18 @@ export default function Component() {
   // Aba ativa: "go" ou "cadastro"
   const [activeTab, setActiveTab] = useState("go");
 
-  // Mostrar/ocultar nota técnica em tela
-  const [showNote, setShowNote] = useState(false);
+  // Nota técnica em contexto (por embarcação/posição)
+  const [noteContext, setNoteContext] = useState(null); // {slot, vessel, verdict}
+
+  // Modal de "Adicionar embarcação" (na aba de Base)
+  const [showAddModal, setShowAddModal] = useState(false);
+  const [newVessel, setNewVessel] = useState({
+    name: "",
+    category: "A",
+    loa: "",
+    draft: "",
+    beam: "",
+  });
 
   // Carrega base do localStorage (cache local inicial)
   useEffect(() => {
@@ -131,6 +158,11 @@ export default function Component() {
     }
   }, [vesselDB]);
 
+  // Se meto, profundidade ou atribuições mudarem, limpamos nota técnica atual
+  useEffect(() => {
+    setNoteContext(null);
+  }, [berthAssignments, meto, depth]);
+
   function genId() {
     return (
       Date.now().toString(36) + Math.random().toString(36).slice(2, 8)
@@ -153,34 +185,24 @@ export default function Component() {
 
   function removeVessel(id) {
     setVesselDB((prev) => prev.filter((v) => v.id !== id));
+
+    // Remove a embarcação de qualquer posição em que esteja atribuída
+    setBerthAssignments((prev) => {
+      const next = { ...prev };
+      Object.keys(next).forEach((key) => {
+        if (next[key] === id) next[key] = "";
+      });
+      return next;
+    });
   }
 
-  // Sugestões de nome conforme digita
-  const nameSuggestions = useMemo(() => {
-    const term = vessel.name.trim().toLowerCase();
-    if (term.length < 1) return [];
-    return vesselDB.filter((v) => v.name.toLowerCase().includes(term));
-  }, [vessel.name, vesselDB]);
-
-  const verdict = useMemo(
-    () => goNoGo(vessel.name ? vessel : null, meto, depth),
-    [vessel, meto, depth]
-  );
-
-  const isReady = Boolean(vessel.name && vessel.category);
-
-  // Sempre que embarcação ou meto mudarem, escondemos a nota antiga
-  useEffect(() => {
-    setShowNote(false);
-  }, [vessel, meto, depth]);
-
-  // -------- Integração GitHub (manual, via botões) --------
+  // -------- Integração GitHub (manual, via botões na aba de Base) --------
 
   async function importFromGitHub() {
     try {
       setSyncStatus("loading");
-      const res = await fetch("data/vessels");
-      if (!res.ok) throw new Error("Falha ao ler data/vessels");
+      const res = await fetch("/api/vessels");
+      if (!res.ok) throw new Error("Falha ao ler /api/vessels");
       const json = await res.json();
       if (Array.isArray(json.data)) {
         setVesselDB(json.data);
@@ -201,13 +223,13 @@ export default function Component() {
   async function saveToGitHub() {
     try {
       setSyncStatus("saving");
-      const res = await fetch("/data/vessels", {
+      const res = await fetch("/api/vessels", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ data: vesselDB, sha: githubSha }),
       });
 
-      if (!res.ok) throw new Error("Falha ao salvar /data/vessels");
+      if (!res.ok) throw new Error("Falha ao salvar /api/vessels");
 
       const json = await res.json();
       if (json.sha) setGithubSha(json.sha);
@@ -228,6 +250,19 @@ export default function Component() {
 
   const syncLabel = syncLabelMap[syncStatus] || "";
 
+  // -------- GO/NO-GO por posição de píer --------
+
+  const slotVerdicts = useMemo(() => {
+    return PIER_SLOTS.map((slot) => {
+      const vesselId = berthAssignments[slot.id];
+      const vessel = vesselDB.find((v) => v.id === vesselId) || null;
+      const verdict = vessel ? goNoGo(vessel, meto, depth) : null;
+      return { slot, vessel, verdict };
+    });
+  }, [berthAssignments, vesselDB, meto, depth]);
+
+  const anySelected = slotVerdicts.some((sv) => sv.vessel);
+
   return (
     <div className="min-h-screen bg-white p-6 max-w-5xl mx-auto space-y-4">
       <header className="border-b pb-3 mb-2 flex items-center justify-between">
@@ -236,7 +271,7 @@ export default function Component() {
             Sistema de Validação de Navegação Portuária
           </p>
           <h1 className="text-base font-semibold mt-1">
-            SVNP-Imbetiba — V3.3 (GO/NO-GO + Base de Embarcações)
+            SVNP-Imbetiba — V3.4 (GO/NO-GO por Píer)
           </h1>
         </div>
         <div className="text-right text-[11px] text-gray-500">
@@ -274,7 +309,7 @@ export default function Component() {
 
       {activeTab === "go" ? (
         <>
-          {/* Grid principal: METO x Embarcação */}
+          {/* Grid principal: METO x Posições de Píer */}
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             {/* METO */}
             <section className="border rounded-xl p-4 space-y-3">
@@ -364,7 +399,7 @@ export default function Component() {
                   >
                     <option>Enchente</option>
                     <option>Vazante</option>
-                    <option>Preamar</option>
+                    <option>Estofa</option>
                   </select>
                 </div>
               </div>
@@ -375,196 +410,185 @@ export default function Component() {
               </p>
             </section>
 
-            {/* EMBARCAÇÃO */}
+            {/* Disposição por Píer */}
             <section className="border rounded-xl p-4 space-y-3">
               <h2 className="text-sm font-semibold uppercase text-gray-600">
-                Embarcação
+                Posições de Atracação (P1 / P2 / P3 · Praia / Mar)
               </h2>
 
-              <div className="space-y-3 text-sm">
-                <div className="relative">
-                  <label className="text-xs text-gray-600">Nome</label>
-                  <input
-                    value={vessel.name}
-                    onChange={(e) =>
-                      setVessel((prev) => ({ ...prev, name: e.target.value }))
-                    }
-                    placeholder="Digite o nome da embarcação"
-                    className="mt-1 w-full border rounded-lg p-2 text-sm"
-                  />
+              <p className="text-[11px] text-gray-500 mb-1">
+                Selecione, para cada posição, uma embarcação cadastrada na base para análise de
+                GO/NO-GO frente às condições informadas.
+              </p>
 
-                  {/* Lista suspensa de sugestões */}
-                  {vessel.name.trim() !== "" && (
-                    <div className="absolute z-10 mt-1 w-full rounded-md border bg-white shadow-lg text-xs max-h-40 overflow-auto">
-                      {nameSuggestions.length > 0 ? (
-                        nameSuggestions.map((v) => (
-                          <button
-                            key={v.id}
-                            type="button"
-                            onClick={() =>
-                              setVessel({
-                                name: v.name,
-                                category: v.category || "A",
-                                loa: v.loa != null ? String(v.loa) : "",
-                                draft: v.draft != null ? String(v.draft) : "",
-                                beam: v.beam != null ? String(v.beam) : "",
-                              })
-                            }
-                            className="block w-full px-3 py-1 text-left hover:bg-gray-100"
-                          >
-                            {v.name}{" "}
-                            <span className="text-[10px] text-gray-500">
-                              (cat. {v.category})
-                            </span>
-                          </button>
-                        ))
-                      ) : (
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-sm">
+                {PIER_SLOTS.map((slot) => {
+                  const term = (berthSearch[slot.id] || "").trim().toLowerCase();
+                  const suggestions = term
+                    ? vesselDB.filter((v) =>
+                        v.name.toLowerCase().includes(term)
+                      )
+                    : vesselDB;
+
+                  const selectedVessel = vesselDB.find(
+                    (v) => v.id === berthAssignments[slot.id]
+                  );
+
+                  return (
+                    <div key={slot.id} className="border rounded-lg p-2 relative">
+                      <p className="text-xs font-semibold text-gray-700 mb-1">
+                        {slot.label}
+                      </p>
+                      <input
+                        value={berthSearch[slot.id] || ""}
+                        onChange={(e) => {
+                          const value = e.target.value;
+                          setBerthSearch((prev) => ({
+                            ...prev,
+                            [slot.id]: value,
+                          }));
+                          // não altera a atribuição até escolher uma sugestão
+                        }}
+                        placeholder="Digite o nome e selecione"
+                        className="w-full border rounded-lg p-2 text-xs"
+                      />
+                      {selectedVessel && (
+                        <p className="mt-1 text-[10px] text-gray-500">
+                          Selecionado: <strong>{selectedVessel.name}</strong>{" "}
+                          {selectedVessel.category
+                            ? `(cat. ${selectedVessel.category})`
+                            : ""}
+                        </p>
+                      )}
+
+                      {/* Lista de sugestões */}
+                      {term && suggestions.length > 0 && (
+                        <div className="absolute z-20 mt-1 w-full rounded-md border bg-white shadow-lg text-[11px] max-h-40 overflow-auto">
+                          {suggestions.map((v) => (
+                            <button
+                              key={v.id}
+                              type="button"
+                              onClick={() => {
+                                setBerthAssignments((prev) => ({
+                                  ...prev,
+                                  [slot.id]: v.id,
+                                }));
+                                setBerthSearch((prev) => ({
+                                  ...prev,
+                                  [slot.id]: v.name,
+                                }));
+                              }}
+                              className="block w-full px-3 py-1 text-left hover:bg-gray-100"
+                            >
+                              {v.name}{" "}
+                              <span className="text-[10px] text-gray-500">
+                                {v.category ? `(cat. ${v.category})` : ""}
+                              </span>
+                            </button>
+                          ))}
+                        </div>
+                      )}
+
+                      {/* Botão limpar posição */}
+                      {selectedVessel && (
                         <button
                           type="button"
-                          onClick={() =>
-                            upsertVessel({
-                              name: vessel.name.trim(),
-                              category: vessel.category,
-                              loa: vessel.loa ? Number(vessel.loa) : undefined,
-                              draft: vessel.draft
-                                ? Number(vessel.draft)
-                                : undefined,
-                              beam: vessel.beam
-                                ? Number(vessel.beam)
-                                : undefined,
-                            })
-                          }
-                          className="block w-full px-3 py-2 text-left text-gray-700 hover:bg-gray-100"
+                          onClick={() => {
+                            setBerthAssignments((prev) => ({
+                              ...prev,
+                              [slot.id]: "",
+                            }));
+                            setBerthSearch((prev) => ({
+                              ...prev,
+                              [slot.id]: "",
+                            }));
+                          }}
+                          className="mt-2 inline-flex items-center rounded-md border px-2 py-0.5 text-[10px] text-gray-600"
                         >
-                          ➕ Cadastrar "{vessel.name.trim()}" na base de embarcações
+                          Limpar posição
                         </button>
                       )}
                     </div>
-                  )}
-                </div>
-
-                <div className="grid grid-cols-3 gap-3">
-                  <div>
-                    <label className="text-xs text-gray-600">Categoria</label>
-                    <select
-                      value={vessel.category}
-                      onChange={(e) =>
-                        setVessel((prev) => ({ ...prev, category: e.target.value }))
-                      }
-                      className="mt-1 w-full border rounded-lg p-2 text-sm"
-                    >
-                      <option value="A">A</option>
-                      <option value="B">B</option>
-                      <option value="C">C</option>
-                      <option value="Tanque">Tanque</option>
-                    </select>
-                  </div>
-
-                  <div>
-                    <label className="text-xs text-gray-600">LOA (m)</label>
-                    <input
-                      type="number"
-                      step="0.1"
-                      value={vessel.loa}
-                      onChange={(e) =>
-                        setVessel((prev) => ({ ...prev, loa: e.target.value }))
-                      }
-                      className="mt-1 w-full border rounded-lg p-2 text-sm"
-                    />
-                  </div>
-
-                  <div>
-                    <label className="text-xs text-gray-600">Calado (m)</label>
-                    <input
-                      type="number"
-                      step="0.1"
-                      value={vessel.draft}
-                      onChange={(e) =>
-                        setVessel((prev) => ({ ...prev, draft: e.target.value }))
-                      }
-                      className="mt-1 w-full border rounded-lg p-2 text-sm"
-                    />
-                  </div>
-
-                  <div>
-                    <label className="text-xs text-gray-600">Boca (m)</label>
-                    <input
-                      type="number"
-                      step="0.1"
-                      value={vessel.beam}
-                      onChange={(e) =>
-                        setVessel((prev) => ({ ...prev, beam: e.target.value }))
-                      }
-                      className="mt-1 w-full border rounded-lg p-2 text-sm"
-                    />
-                  </div>
-                </div>
-
-                <div className="pt-1 text-[11px] text-gray-500">
-                  <p>
-                    • Comece a digitar o nome para buscar na base. Se não existir, use a opção de
-                    cadastro exibida abaixo do campo.
-                  </p>
-                </div>
+                  );
+                })}
               </div>
             </section>
           </div>
 
-          {/* Bloco de resultado GO/NO-GO */}
+          {/* Bloco de resultado GO/NO-GO por posição */}
           <section className="border rounded-xl p-4 space-y-3 bg-gray-50">
             <h2 className="text-sm font-semibold uppercase text-gray-600">
-              Resultado — GO / NO-GO
+              Resultado — GO / NO-GO por Posição de Píer
             </h2>
 
-            {!isReady ? (
+            {!anySelected ? (
               <p className="text-sm text-gray-500">
-                Informe pelo menos o <strong>nome</strong> e a <strong>categoria</strong> da
-                embarcação para calcular o resultado.
+                Selecione ao menos uma embarcação nas posições de píer ao lado para calcular o
+                resultado de GO/NO-GO.
               </p>
-            ) : verdict ? (
-              <div className="space-y-2 text-sm">
-                <div className="flex items-center gap-2">
-                  <span
-                    className={
-                      "inline-flex items-center rounded-full px-3 py-1 text-xs font-semibold " +
-                      (verdict.ok
-                        ? "bg-emerald-100 text-emerald-700 border border-emerald-200"
-                        : "bg-red-100 text-red-700 border border-red-200")
-                    }
-                  >
-                    {verdict.ok ? "GO" : "NO-GO"}
-                  </span>
-                  <span className="text-xs text-gray-600">{verdict.reason}</span>
-                </div>
-
-                <p className="text-xs text-gray-600">
-                  Embarcação <strong>{vessel.name}</strong> (cat. {vessel.category}) — Setor
-                  <strong> {meto.sector}</strong>, vento
-                  <strong> {meto.wind}/{meto.gust} kn</strong>, Hs/Tp
-                  <strong> {meto.hs} m / {meto.tp} s</strong>, costado
-                  <strong> {depth} m</strong>.
-                </p>
-
-                {!verdict.ok && (
-                  <button
-                    type="button"
-                    onClick={() => setShowNote(true)}
-                    className="mt-2 inline-flex items-center rounded-lg border border-red-300 bg-red-50 px-3 py-1.5 text-xs font-medium text-red-700"
-                  >
-                    📄 Exibir Nota Técnica de NO-GO
-                  </button>
-                )}
-              </div>
             ) : (
-              <p className="text-sm text-gray-500">
-                Ajuste os parâmetros meteoceanográficos e os dados da embarcação para visualizar o
-                resultado.
-              </p>
+              <div className="overflow-auto">
+                <table className="min-w-full text-xs">
+                  <thead>
+                    <tr className="text-left border-b bg-gray-100">
+                      <th className="py-2 pr-3">Posição</th>
+                      <th className="py-2 pr-3">Embarcação</th>
+                      <th className="py-2 pr-3">Categoria</th>
+                      <th className="py-2 pr-3">Resultado</th>
+                      <th className="py-2 pr-3">Ações</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {slotVerdicts.map(({ slot, vessel, verdict }) => {
+                      if (!vessel) return null;
+                      const ok = verdict && verdict.ok;
+                      return (
+                        <tr key={slot.id} className="border-b last:border-0">
+                          <td className="py-2 pr-3 text-xs">{slot.label}</td>
+                          <td className="py-2 pr-3 text-xs font-medium">
+                            {vessel.name}
+                          </td>
+                          <td className="py-2 pr-3 text-xs">{vessel.category}</td>
+                          <td className="py-2 pr-3 text-xs">
+                            {verdict ? (
+                              <span
+                                className={
+                                  "inline-flex items-center rounded-full px-3 py-1 text-[10px] font-semibold " +
+                                  (ok
+                                    ? "bg-emerald-100 text-emerald-700 border border-emerald-200"
+                                    : "bg-red-100 text-red-700 border border-red-200")
+                                }
+                              >
+                                {ok ? "GO" : "NO-GO"} — {verdict.reason}
+                              </span>
+                            ) : (
+                              <span className="text-gray-400 text-[10px]">
+                                —
+                              </span>
+                            )}
+                          </td>
+                          <td className="py-2 pr-3 text-xs">
+                            {!ok && verdict && (
+                              <button
+                                type="button"
+                                onClick={() => setNoteContext({ slot, vessel, verdict })}
+                                className="rounded-md border border-red-300 bg-red-50 px-2 py-1 text-[10px] text-red-700"
+                              >
+                                📄 Nota Técnica
+                              </button>
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
             )}
           </section>
 
-          {/* Nota técnica em tela */}
-          {showNote && verdict && !verdict.ok && (
+          {/* Nota técnica em tela (por embarcação/posição) */}
+          {noteContext && !noteContext.verdict.ok && (
             <section className="mt-4 border rounded-xl p-4 bg-white text-sm">
               <div className="flex items-center justify-between mb-2">
                 <h2 className="text-sm font-semibold uppercase text-gray-700">
@@ -584,7 +608,7 @@ export default function Component() {
                   </button>
                   <button
                     type="button"
-                    onClick={() => setShowNote(false)}
+                    onClick={() => setNoteContext(null)}
                     className="rounded-md border px-3 py-1 text-xs"
                   >
                     Fechar
@@ -599,75 +623,38 @@ export default function Component() {
                   </p>
                 </div>
 
-                <div>
-                  <h3 className="text-xs font-semibold mb-1">1. Identificação da operação</h3>
-                  <table className="min-w-full border text-[11px]">
-                    <tbody>
-                      <tr>
-                        <td className="border px-2 py-1 w-40">Embarcação</td>
-                        <td className="border px-2 py-1">{vessel.name}</td>
-                      </tr>
-                      <tr>
-                        <td className="border px-2 py-1">Categoria</td>
-                        <td className="border px-2 py-1">{vessel.category}</td>
-                      </tr>
-                      <tr>
-                        <td className="border px-2 py-1">LOA</td>
-                        <td className="border px-2 py-1">{vessel.loa || "—"} m</td>
-                      </tr>
-                      <tr>
-                        <td className="border px-2 py-1">Calado</td>
-                        <td className="border px-2 py-1">{vessel.draft || "—"} m</td>
-                      </tr>
-                      <tr>
-                        <td className="border px-2 py-1">Boca</td>
-                        <td className="border px-2 py-1">{vessel.beam || "—"} m</td>
-                      </tr>
-                    </tbody>
-                  </table>
-                </div>
-
-                <div>
-                  <h3 className="text-xs font-semibold mb-1">2. Condições Ambientais</h3>
-                  <table className="min-w-full border text-[11px]">
-                    <tbody>
-                      <tr>
-                        <td className="border px-2 py-1 w-40">Setor</td>
-                        <td className="border px-2 py-1">{meto.sector}</td>
-                      </tr>
-                      <tr>
-                        <td className="border px-2 py-1">Vento</td>
-                        <td className="border px-2 py-1">
-                          {meto.wind} kn (rajada {meto.gust} kn)
-                        </td>
-                      </tr>
-                      <tr>
-                        <td className="border px-2 py-1">Hs / Tp</td>
-                        <td className="border px-2 py-1">
-                          {meto.hs} m / {meto.tp} s
-                        </td>
-                      </tr>
-                      <tr>
-                        <td className="border px-2 py-1">Maré</td>
-                        <td className="border px-2 py-1">{meto.tide}</td>
-                      </tr>
-                      <tr>
-                        <td className="border px-2 py-1">Profundidade (costado)</td>
-                        <td className="border px-2 py-1">{depth} m</td>
-                      </tr>
-                    </tbody>
-                  </table>
-                </div>
-
-                <div>
-                  <h3 className="text-xs font-semibold mb-1">3. Decisão</h3>
-                  <p className="text-[11px]">
-                    <strong>{verdict.ok ? "GO" : "NO-GO"}</strong> — {verdict.reason}
+                <div className="space-y-2 text-[11px] leading-relaxed text-gray-800">
+                  <p>
+                    Prezados,
+                  </p>
+                  <p>
+                    Após a análise das condições meteoceanográficas vigentes e da aplicação dos
+                    limites operacionais previstos para as manobras no Porto de Imbetiba, informamos
+                    que a operação solicitada para a embarcação <strong>{noteContext.vessel.name}</strong>,
+                    posicionada em <strong>{noteContext.slot.label}</strong>, foi classificada como
+                    <strong> NO-GO</strong> no momento da avaliação.
+                  </p>
+                  <p>
+                    No instante da avaliação, observou-se vento de {meto.wind} kn, com rajada
+                    atingindo {meto.gust} kn, além de altura significativa de onda (Hs) de {meto.hs} m
+                    e período de pico (Tp) de {meto.tp} s, circunstâncias que excedem os limites
+                    operacionais definidos para o setor {meto.sector}.
+                  </p>
+                  <p>
+                    Diante desse cenário, verificou-se que os parâmetros ambientais apresentaram
+                    valores superiores ao permitido para uma manobra segura, resultando na aplicação
+                    automática do critério de <strong>NO-GO</strong>, conforme registrado pelo sistema:
+                    <strong> "{noteContext.verdict.reason}"</strong>.
+                  </p>
+                  <p>
+                    Ressaltamos que a decisão refere-se exclusivamente ao momento da análise. As
+                    condições encontram-se em monitoramento contínuo e, tão logo haja uma janela
+                    operacional compatível com os limites estabelecidos, a equipe técnica sinalizará a
+                    possibilidade de execução da manobra.
                   </p>
                 </div>
 
-                <div>
-                  <h3 className="text-xs font-semibold mb-1">4. Assinatura</h3>
+                <div className="pt-2 mt-2 border-t">
                   <p className="text-[11px] leading-relaxed">
                     <strong>OFICIAIS PORTUÁRIOS</strong>
                     <br />
@@ -676,6 +663,16 @@ export default function Component() {
                     <strong>DELTA II</strong>
                     <br />
                     LOEP / LPM / OPRT-M
+                  </p>
+                </div>
+
+                <div>
+                  <p className="text-[10px] text-gray-500 italic mt-2">
+                    Esta avaliação segue os parâmetros definidos no Estudo de Manobras realizado pela
+                    Universidade de São Paulo (USP), validados pela Capitania dos Portos de Macaé e
+                    incorporados integralmente na NPCP-CPM. Todas as informações aqui descritas
+                    derivam de limites e diretrizes oficialmente estabelecidos para garantir a
+                    segurança da navegação e das operações portuárias no Porto de Imbetiba.
                   </p>
                 </div>
               </div>
@@ -711,6 +708,13 @@ export default function Component() {
                   className="rounded-md border px-2 py-1 text-[10px]"
                 >
                   Salvar no GitHub
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setShowAddModal(true)}
+                  className="rounded-md border px-2 py-1 text-[10px] bg-black text-white"
+                >
+                  Adicionar embarcação
                 </button>
               </div>
             </div>
@@ -750,15 +754,22 @@ export default function Component() {
                         <div className="flex flex-wrap gap-1">
                           <button
                             type="button"
-                            onClick={() =>
-                              setVessel({
-                                name: v.name,
-                                category: v.category || "A",
-                                loa: v.loa != null ? String(v.loa) : "",
-                                draft: v.draft != null ? String(v.draft) : "",
-                                beam: v.beam != null ? String(v.beam) : "",
-                              })
-                            }
+                            onClick={() => {
+                              // Preenche a primeira posição livre com esta embarcação
+                              setBerthAssignments((prev) => {
+                                const next = { ...prev };
+                                const usedIds = new Set(Object.values(next));
+                                if (usedIds.has(v.id)) return next;
+                                for (const slot of PIER_SLOTS) {
+                                  if (!next[slot.id]) {
+                                    next[slot.id] = v.id;
+                                    break;
+                                  }
+                                }
+                                return next;
+                              });
+                              setActiveTab("go");
+                            }}
                             className="rounded-md border px-2 py-1 text-[10px]"
                           >
                             Usar no GO/NO-GO
@@ -778,6 +789,140 @@ export default function Component() {
               </tbody>
             </table>
           </div>
+
+          {/* Popup de Adicionar Embarcação */}
+          {showAddModal && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
+              <div className="w-[min(420px,95vw)] rounded-2xl bg-white p-4 shadow-xl space-y-3">
+                <div className="flex items-center justify-between mb-1">
+                  <h3 className="text-sm font-semibold">Adicionar embarcação</h3>
+                  <button
+                    type="button"
+                    onClick={() => setShowAddModal(false)}
+                    className="rounded-md border px-2 py-1 text-[11px]"
+                  >
+                    Fechar
+                  </button>
+                </div>
+                <p className="text-[11px] text-gray-500">
+                  Informe os dados básicos da embarcação para cadastro na base do SVNP.
+                </p>
+
+                <div className="space-y-2 text-sm">
+                  <div>
+                    <label className="text-xs text-gray-600">Nome</label>
+                    <input
+                      value={newVessel.name}
+                      onChange={(e) =>
+                        setNewVessel((prev) => ({ ...prev, name: e.target.value }))
+                      }
+                      className="mt-1 w-full border rounded-lg p-2 text-sm"
+                      placeholder="Nome da embarcação"
+                    />
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-2">
+                    <div>
+                      <label className="text-xs text-gray-600">Categoria</label>
+                      <select
+                        value={newVessel.category}
+                        onChange={(e) =>
+                          setNewVessel((prev) => ({
+                            ...prev,
+                            category: e.target.value,
+                          }))
+                        }
+                        className="mt-1 w-full border rounded-lg p-2 text-sm"
+                      >
+                        <option value="A">A</option>
+                        <option value="B">B</option>
+                        <option value="C">C</option>
+                        <option value="Tanque">Tanque</option>
+                      </select>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-3 gap-2">
+                    <div>
+                      <label className="text-xs text-gray-600">LOA (m)</label>
+                      <input
+                        type="number"
+                        step="0.1"
+                        value={newVessel.loa}
+                        onChange={(e) =>
+                          setNewVessel((prev) => ({ ...prev, loa: e.target.value }))
+                        }
+                        className="mt-1 w-full border rounded-lg p-2 text-sm"
+                      />
+                    </div>
+                    <div>
+                      <label className="text-xs text-gray-600">Calado (m)</label>
+                      <input
+                        type="number"
+                        step="0.1"
+                        value={newVessel.draft}
+                        onChange={(e) =>
+                          setNewVessel((prev) => ({ ...prev, draft: e.target.value }))
+                        }
+                        className="mt-1 w-full border rounded-lg p-2 text-sm"
+                      />
+                    </div>
+                    <div>
+                      <label className="text-xs text-gray-600">Boca (m)</label>
+                      <input
+                        type="number"
+                        step="0.1"
+                        value={newVessel.beam}
+                        onChange={(e) =>
+                          setNewVessel((prev) => ({ ...prev, beam: e.target.value }))
+                        }
+                        className="mt-1 w-full border rounded-lg p-2 text-sm"
+                      />
+                    </div>
+                  </div>
+                </div>
+
+                <div className="flex justify-end gap-2 pt-2">
+                  <button
+                    type="button"
+                    onClick={() => setShowAddModal(false)}
+                    className="rounded-md border px-3 py-1.5 text-xs"
+                  >
+                    Cancelar
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const name = newVessel.name.trim();
+                      if (!name) return;
+                      upsertVessel({
+                        name,
+                        category: newVessel.category,
+                        loa: newVessel.loa ? Number(newVessel.loa) : undefined,
+                        draft: newVessel.draft
+                          ? Number(newVessel.draft)
+                          : undefined,
+                        beam: newVessel.beam
+                          ? Number(newVessel.beam)
+                          : undefined,
+                      });
+                      setNewVessel({
+                        name: "",
+                        category: "A",
+                        loa: "",
+                        draft: "",
+                        beam: "",
+                      });
+                      setShowAddModal(false);
+                    }}
+                    className="rounded-md border px-3 py-1.5 text-xs bg-black text-white"
+                  >
+                    Salvar embarcação
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
         </section>
       )}
     </div>
